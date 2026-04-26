@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+.idea/
+.vscode/
+.DS_Store
+
+# 缝隙场存档（建议另外备份，不必入库）
+data/
+
+# 模型文件
+*.gguf
+*.bin
+*.safetensors
