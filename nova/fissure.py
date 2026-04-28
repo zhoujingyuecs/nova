@@ -10,8 +10,23 @@
   - flow_count：历史上有多少次水流流经此处。
   - last_flow_time：最近一次被填满的时间戳。
 
-水流冲刷时，缝隙形状朝水流形状偏移；偏移的速度由"可塑性"
-决定，可塑性又由局部水流密度决定（见 field.py）。
+  ★ 新增：outgoing_links —— 这道缝隙通向哪些其他缝隙的"地下通道"
+    -----------------------------------------------------------
+    旧版本的水流只看几何相似度（语义近不近），结果就是水容易
+    陷在一团相似的回忆里转圈，像个实心球。
+
+    显式链接是为了把"陶土球"里那些**真正的裂缝**显式地刻出来——
+    两条在语义上很远的回忆，如果它们在一段经历里挨着出现过，
+    就该有一条直通的暗道。
+
+    这就是"高低不平的洞穴"，让水能从一个山谷流到另一个山谷，
+    而不只是顺着等高线绕圈。
+
+    存的是 dict[target_id, strength]：
+      - 单向。A→B 不等于 B→A。
+      - 想要双向就显式存两条（A→B 和 B→A）。
+      - strength 是浮点数，可以累加：每次共同被想起就强化一次。
+      - 没有上限——但消费时我们会用 log 之类把它压一压。
 """
 
 from __future__ import annotations
@@ -26,21 +41,30 @@ import numpy as np
 
 @dataclass
 class Fissure:
+	# ---------- 内容与形状 ----------
 	content: str
 	shape: np.ndarray            # 当前形状（单位向量）
 	origin_shape: np.ndarray     # 出生时的形状（不可变，用于度量漂移）
 
+	# ---------- 身份与统计 ----------
 	id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 	flow_count: int = 0
 	last_flow_time: float = field(default_factory=time.time)
 	creation_time: float = field(default_factory=time.time)
+
+	# ---------- 显式裂缝（这是这次改动的核心） ----------
+	# key: 目标缝隙的 id
+	# value: 链接强度（>0；越大越倾向走这条暗道）
+	outgoing_links: dict = field(default_factory=dict)
 
 	def __post_init__(self):
 		# 把形状统一归一化到单位球面上，所有相似度都用余弦
 		self.shape = _normalize(self.shape)
 		self.origin_shape = _normalize(self.origin_shape)
 
-	# ---------- 动力学 ----------
+	# ==========================================================
+	#                       动力学
+	# ==========================================================
 	def shift_toward(self, target_shape: np.ndarray, plasticity: float,
 					 new_content: Optional[str] = None,
 					 rewrite_threshold: float = 0.45) -> None:
@@ -74,7 +98,44 @@ class Fissure:
 	def quiet_seconds(self) -> float:
 		return time.time() - self.last_flow_time
 
-	# ---------- 序列化 ----------
+	# ==========================================================
+	#                      链接管理
+	# ==========================================================
+	def link_to(self, target_id: str, strength_delta: float = 1.0,
+				cap: float = 16.0) -> None:
+		"""加一条（或加强一条）通往 target_id 的暗道。
+
+		如果已存在，强度累加；并夹一个上限，防止热点链接无止境膨胀。
+		"""
+		if target_id == self.id:
+			return  # 不允许自连——会让水流原地打转
+		current = self.outgoing_links.get(target_id, 0.0)
+		new_strength = min(current + strength_delta, cap)
+		self.outgoing_links[target_id] = new_strength
+
+	def unlink(self, target_id: str) -> None:
+		self.outgoing_links.pop(target_id, None)
+
+	def decay_links(self, factor: float = 0.95, floor: float = 0.05) -> int:
+		"""所有出度链接强度统一乘一个 <1 的衰减因子。
+
+		低于 floor 的链接被认为已经"裂开了"，从字典里删掉。
+		返回被删掉的链接数。睡眠期会用到。
+		"""
+		removed = []
+		for tid in list(self.outgoing_links.keys()):
+			s = self.outgoing_links[tid] * factor
+			if s < floor:
+				removed.append(tid)
+			else:
+				self.outgoing_links[tid] = s
+		for tid in removed:
+			del self.outgoing_links[tid]
+		return len(removed)
+
+	# ==========================================================
+	#                       序列化
+	# ==========================================================
 	def to_dict(self) -> dict:
 		return {
 			"id": self.id,
@@ -82,6 +143,8 @@ class Fissure:
 			"flow_count": self.flow_count,
 			"last_flow_time": self.last_flow_time,
 			"creation_time": self.creation_time,
+			# 链接也存下来。空 dict 也写进去，结构清晰
+			"outgoing_links": dict(self.outgoing_links),
 		}
 
 	@classmethod
@@ -95,6 +158,9 @@ class Fissure:
 			last_flow_time=d.get("last_flow_time", time.time()),
 			creation_time=d.get("creation_time", time.time()),
 		)
+		# 兼容旧存档：旧版没有 outgoing_links，给空 dict 即可
+		raw_links = d.get("outgoing_links", {}) or {}
+		f.outgoing_links = {str(k): float(v) for k, v in raw_links.items()}
 		return f
 
 

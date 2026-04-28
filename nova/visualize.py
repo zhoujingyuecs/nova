@@ -5,11 +5,14 @@
   - 点的位置 ── 缝隙在语义空间的位置（投影后）
   - 点的大小 ── flow_count（被流过的次数，越大越显眼）
   - 点的颜色 ── 最近一次被刷过的距今时间（越红越新鲜，越蓝越冷僻）
+  - ★ 点之间的细线 ── 显式的 outgoing_links（暗道）
+                      线粗细随链接强度变化
 
 这给你两个直觉：
   ① 高频区域成团聚集 ── 那是 nova 当前的"思维焦点"，
                         也是高可塑性 / 短期记忆的来源；
   ② 散落在外围的冷蓝点 ── 那是稳定的长期记忆。
+  ③ ★ 跨簇的线 ── 那些就是真正意义上的"裂缝"，水流跨山谷的暗道。
 
 PCA 默认快、确定、零参数；t-SNE 看局部结构更好但慢且不稳定。
 默认 PCA。
@@ -63,10 +66,14 @@ def render_field(
 	method: Literal["pca", "tsne"] = "pca",
 	title: Optional[str] = None,
 	annotate_top: int = 6,
+	draw_links: bool = True,
+	max_links_drawn: int = 400,
 ) -> Optional[str]:
 	"""把当前缝隙场画成一张 PNG。
 
 	annotate_top: 在最热的几条缝隙旁边标注其内容片段。
+	draw_links:   是否画出 outgoing_links。
+	max_links_drawn: 链接太多时只随机画这么多条，避免图变成毛毡。
 	"""
 	if len(field) < 3:
 		return None
@@ -95,12 +102,42 @@ def render_field(
 		proj = PCA(n_components=2, random_state=0).fit_transform(matrix)
 
 	fissures = field.all()
+	id_to_idx = {f.id: i for i, f in enumerate(fissures)}
 	flow_counts = np.array([f.flow_count for f in fissures], dtype=np.float32)
 	quiet = np.array([f.quiet_seconds() for f in fissures], dtype=np.float32)
 	freshness = np.exp(-quiet / 86400.0)
 	sizes = 30.0 + 18.0 * np.log1p(flow_counts)
 
 	fig, ax = plt.subplots(figsize=(11, 11))
+
+	# ---- 画链接（先画，所以会在散点下面） ----
+	if draw_links:
+		import random
+
+		all_links = []
+		for src in fissures:
+			si = id_to_idx[src.id]
+			for tid, strength in src.outgoing_links.items():
+				ti = id_to_idx.get(tid)
+				if ti is None:
+					continue
+				all_links.append((si, ti, float(strength)))
+		if len(all_links) > max_links_drawn:
+			all_links = random.sample(all_links, max_links_drawn)
+
+		for si, ti, strength in all_links:
+			# 强度 → 透明度 + 粗细
+			alpha = min(0.05 + 0.04 * np.log1p(strength), 0.35)
+			lw = 0.3 + 0.15 * np.log1p(strength)
+			ax.plot(
+				[proj[si, 0], proj[ti, 0]],
+				[proj[si, 1], proj[ti, 1]],
+				color="#666666",
+				alpha=alpha,
+				linewidth=lw,
+				zorder=1,
+			)
+
 	scat = ax.scatter(
 		proj[:, 0],
 		proj[:, 1],
@@ -112,6 +149,7 @@ def render_field(
 		linewidth=0.45,
 		vmin=0.0,
 		vmax=1.0,
+		zorder=2,
 	)
 
 	# 注释最热的若干条（中文字体不可用时跳过 —— 一堆方框反而难看）
@@ -128,6 +166,7 @@ def render_field(
 				alpha=0.85,
 				xytext=(6, 4),
 				textcoords="offset points",
+				zorder=3,
 			)
 
 	cbar = plt.colorbar(scat, ax=ax, fraction=0.04, pad=0.02)
@@ -139,10 +178,11 @@ def render_field(
 
 	if title is None:
 		title = "nova 的陶土球" if has_cjk else "nova's clay ball"
+	stats = field.link_stats()
 	subtitle = (
-		f"{len(field)} 道缝隙 · {method.upper()} 投影"
+		f"{len(field)} 道缝隙 · {stats['total_links']} 条暗道 · {method.upper()} 投影"
 		if has_cjk
-		else f"{len(field)} fissures · {method.upper()} projection"
+		else f"{len(field)} fissures · {stats['total_links']} links · {method.upper()} projection"
 	)
 	ax.set_title(f"{title}\n{subtitle}", fontsize=13)
 	ax.set_xticks([])

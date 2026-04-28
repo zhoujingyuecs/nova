@@ -26,7 +26,9 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
 
 @dataclass
 class NovaConfig:
-	# ---------- LLM (llama_cpp) ----------
+	# ============================================================
+	#                  LLM (llama_cpp)
+	# ============================================================
 	model_path: str = os.environ.get(
 		"NOVA_MODEL_PATH",
 		"/home/zhou/shared/model/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
@@ -42,65 +44,123 @@ class NovaConfig:
 	max_tokens: int = 4096        # 单次回答的上限
 	stop_tokens: tuple = ("<|im_end|>",)
 
-	# ---------- 嵌入模型 ----------
+	# ============================================================
+	#                       嵌入模型
+	# ============================================================
 	# 默认用 BGE-small-zh 中文模型；要英文/多语言可换 BAAI/bge-m3
 	embedding_model: str = "BAAI/bge-small-zh-v1.5"
 	embedding_device: str = "cpu"   # "cuda" 也可，但 3090 显存基本被 LLM 占了
 
-	# ---------- 缝隙场（陶土球） ----------
-	# 一次水流最多可以激活的字符数（粗略对应 context tokens）
-	flow_budget_chars: int = 8000
-	# 一次水流最多走过的缝隙数（防止意识无止境游荡）
-	flow_max_steps: int = 24
-	# 入水点附近，先抓几个缝隙做种子
-	flow_seed_count: int = 3
-	# 每跳一步看几个邻居
-	flow_branch_factor: int = 5
-	# 邻居选择的随机扰动（高斯标准差），越大越像漫游
-	flow_noise: float = 0.08
-	# 创建新缝隙的相似度阈值：候选与最近邻相似度低于此值才会被记下
-	create_threshold: float = 0.85
-	# 每条缝隙最长承载的字数。过长则截断（避免单条记忆吞掉全部水量）
-	max_fissure_chars: int = 280
+	# ============================================================
+	#                  缝隙场（陶土球）
+	# ============================================================
+	flow_budget_chars: int = 8000     # 一次水流可以装的总字符数（≈ token 预算）
+	flow_max_steps: int = 24          # 一次水流最多激活几条缝隙
+	flow_seed_count: int = 3          # 入水点（从种子最近的几条开始）
+	flow_branch_factor: int = 5       # 每步从几何邻居里取几条作为候选
+	flow_noise: float = 0.08          # 候选打分上加的高斯噪声标准差
+	create_threshold: float = 0.85    # 新刺激跟最近邻 sim ≥ 这个值时不新建
+	max_fissure_chars: int = 280      # 单条缝隙内容的最大长度
 
-	# ---------- 可塑性（决定记忆寿命） ----------
-	# 基础可塑性 —— 在没有任何水流密度时，缝隙朝当前水流偏移多少
+	# ---- 新版水流（暗道、防扎堆、冷跳） ----
+	# 暗道权重：跟着 outgoing_links 跳的得分倍率。调高 → 更倾向走经验暗道
+	link_weight: float = 1.6
+	# 几何权重：单纯按余弦近邻的得分倍率
+	geometric_weight: float = 1.0
+	# 链接强度的累加上限——防止某条超热门链接吸走所有水流
+	link_strength_cap: float = 16.0
+	# 冷跳概率：每一步以这个概率往候选池里塞一条遗忘了很久的缝隙
+	cold_jump_prob: float = 0.10
+	# 冷跳的固定得分（让它能和正常候选比一比）
+	cold_jump_score: float = 0.55
+	# "近期历史"里出现过的缝隙在打分时乘的折扣（<1）；越小越避免重复
+	recent_penalty: float = 0.35
+	# 跨次水流追踪：Nova 实例里维持一个多大的历史 deque
+	recent_history_size: int = 32
+	# frontier 滑动窗口：水流"目前所在的几条缝隙"
+	flow_frontier_size: int = 4
+	# 水流位置的漂移率——每激活一条缝隙，位置朝它挪动多少
+	# 越大 → 水越"贴着"刚走过的；越小 → 水保留更多种子的方向
+	flow_drift: float = 0.35
+
+	# ============================================================
+	#               意象拆解（imagery extraction）
+	# ============================================================
+	# ★ 这次新增的关键能力：长输入会被 LLM 拆成若干个意象，
+	# 每个意象成为一条缝隙，按出现顺序两两建立有向链接。
+	imagery_enabled: bool = True
+	imagery_min_input_chars: int = 60      # 输入短于这个就不拆，省一次 LLM
+	imagery_max_count: int = 6              # 每段输入最多拆出几个意象
+	imagery_max_tokens: int = 600           # 拆解 LLM 调用的最大 token
+	# 一段经历内"前后相邻"的意象之间链接的衰减——A→B 强；A→C 弱
+	imagery_link_decay: float = 0.6
+	imagery_link_distance: int = 3          # 多远以内的意象建链
+	imagery_link_base: float = 1.2          # 链接初始强度
+	# 一次水流走过的缝隙之间也会建链（赫布学习）
+	flow_coactivation_link_strength: float = 0.4
+	flow_coactivation_distance: int = 3
+
+	# ============================================================
+	#                      可塑性
+	# ============================================================
 	base_plasticity: float = 0.04
-	# 可塑性随水流密度增长的对数斜率
 	density_plasticity_gain: float = 0.18
-	# 可塑性的上限（避免一次水流就把记忆完全替换掉）
 	max_plasticity: float = 0.55
-	# 局部密度的余弦半径（< this 的相似度都算"附近"）
 	density_radius: float = 0.18
-	# 24 小时的密度时间常数，老的水流贡献会衰减
 	density_time_constant_seconds: float = 86400.0
 
-	# ---------- 走神 / 做梦 ----------
-	# 后台走神线程是否启用（chat REPL 默认开；脚本式调用时建议关）
+	# ============================================================
+	#                    走神 / 做梦
+	# ============================================================
 	daydream_enabled: bool = False
-	# 平均每隔多少秒走一次神
 	daydream_interval_seconds: float = 60.0
-	# 间隔的随机抖动比例（±）
 	daydream_jitter: float = 0.4
-	# 走神生成的 token 上限（短一点，避免长篇内心独白）
 	daydream_max_tokens: int = 256
+	# 自我对话提示出现的概率：走神时偶尔提醒她"可以把心里的话送到外面"
+	daydream_self_dialogue_hint_prob: float = 0.20
 
-	# ---------- 睡眠 / 整理 ----------
-	# 修剪条件（必须同时成立）：很久没被刷过 + 几乎没流过 + 漂移很大
-	prune_quiet_threshold: float = 7 * 86400.0   # 7 天没人路过
-	prune_flow_threshold: int = 1                 # 历史只被流过 0 次
-	prune_drift_threshold: float = 0.6            # 已经漂得面目全非
-	# 合并条件：两条缝隙的形状余弦相似度高于此值
+	# ============================================================
+	#                    睡眠 / 整理
+	# ============================================================
+	prune_quiet_threshold: float = 7 * 86400.0
+	prune_flow_threshold: int = 1
+	prune_drift_threshold: float = 0.6
 	merge_threshold: float = 0.93
+	# 链接衰减：睡眠时所有出度链接乘的因子（<1）
+	link_decay_factor: float = 0.95
+	# 衰减后强度低于这个值的链接被认为"裂开了"，删除
+	link_decay_floor: float = 0.05
 
-	# ---------- 持久化 ----------
-	field_path: str = "./data/field"   # 缝隙场的保存目录
-	autosave_every: int = 5            # 每隔几次 perceive 自动保存一次
+	# ============================================================
+	#                       持久化
+	# ============================================================
+	field_path: str = "./data/field"
+	autosave_every: int = 5
 
-	# ---------- 人格 ----------
+	# ============================================================
+	#                       人格
+	# ============================================================
 	system_prompt: str = DEFAULT_SYSTEM_PROMPT
-	# 启动时如果缝隙场为空，从这个文件载入种子记忆（可选）
 	seed_memories_file: Optional[str] = None
+
+	# ============================================================
+	#                  虚拟机里的"那只手"
+	# ============================================================
+	# 留空字符串就等于不启用——nova 会照常工作，只是没有手。
+	# 你的环境：本机 192.168.31.71，虚拟机 192.168.122.102。
+	vm_agent_url: str = os.environ.get("NOVA_VM_URL", "http://192.168.122.102:7100")
+	vm_agent_token: str = os.environ.get("NOVA_VM_TOKEN", "nova-vm-secret-please-change-me")
+	# 一次 perceive 里最多让她伸几次手——防止她无止境地敲命令
+	max_tool_iterations: int = 6
+	# 单次工具调用的 HTTP 超时（秒）
+	vm_request_timeout: float = 60.0
+
+	# ============================================================
+	#               对外窗口（codeloop.cn）
+	# ============================================================
+	# 这是访客和她说话的地方，也是她"和自己说话"的渠道。
+	# 配了这个之后，她会通过 capability_memories 知道自己有这个出口。
+	external_site_url: str = "https://codeloop.cn"
 
 	def __post_init__(self):
 		os.makedirs(self.field_path, exist_ok=True)

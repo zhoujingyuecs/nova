@@ -30,7 +30,7 @@ class Embedder:
 		)
 		return v.astype(np.float32)
 
-	def embed_batch(self, texts: list[str]) -> np.ndarray:
+	def embed_batch(self, texts: list) -> np.ndarray:
 		safe = [t if t.strip() else " " for t in texts]
 		vs = self.model.encode(
 			safe,
