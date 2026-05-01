@@ -12,14 +12,27 @@
         说明它们承载着同一个意思。合并它们，保留较老那条的内容
         （沉淀更久 → 更接近"主流"用法），把流量计数加起来。
         ★ 合并时把被吸收方的所有出度链接也挪给保留方，避免链接断裂。
+        ★ v0.5 新增：合并时还要修补对话链指针 prev_id / next_id ——
+           被吸收方在某段对话里如果是别人的"上一句"或"下一句"，
+           那条链要无缝接到保留方上，不能让对话链断裂。
 
-  3. ★ 链接衰减（decay_links）
+  3. 链接衰减（decay_links）
      ── 所有出度链接的强度乘一个 <1 的因子。
         强度低于 floor 的链接被认为已经"裂开了"，从字典里删掉。
         这模拟了"长期不被一起想起的两件事，会在心里渐渐分开"的现象。
+        注意：对话链上的暗道因为基础强度很大（forward 4.0、backward 2.5），
+        即便衰减很多次也不容易掉到 floor 之下，所以"刚说过的话"的链
+        会保住相当长一段时间，这是有意为之。
 
 修剪、合并、链接衰减都是不可逆的。可以放在某个固定时刻（比如每天
 凌晨）跑一次，就是字面意义的"睡眠期巩固"。
+
+★ 关于对话型缝隙：
+   对话里每一句话都是独立缝隙（speaker != ""），而且每一句的内容
+   独一无二（"你刚才说的那句话"和"我刚才说的那句话"语义上接近也合
+   并不到一起，因为内容字符串不同）。但万一用户多次重复完全一样的
+   话（"嗯。" / "嗯。"），合并仍然有可能发生——这时候上面对对话链
+   的修补就用得上了。
 """
 
 from __future__ import annotations
@@ -74,8 +87,8 @@ def _prune(field: FissureField, cfg: NovaConfig) -> int:
 			and f.drift() > cfg.prune_drift_threshold
 		):
 			to_remove.append(f.id)
-	# field.remove() 内部会清理所有指向被删缝隙的暗道，所以这里不用
-	# 单独再处理链接
+	# field.remove() 内部会清理所有指向被删缝隙的暗道，以及 prev_id /
+	# next_id 这两种对话链指针，所以这里不用再单独处理。
 	for fid in to_remove:
 		field.remove(fid)
 	return len(to_remove)
@@ -91,9 +104,15 @@ def _merge(field: FissureField, cfg: NovaConfig) -> int:
 	相似度超过阈值的"晚辈"。这样高频用过的那条留下来，作为合并的
 	代表。
 
-	★ 合并时同时合并出度链接：
+	合并时同时合并出度链接：
 	   - 被吸收方的 outgoing_links → 累加到保留方上
 	   - 其他缝隙指向被吸收方的链接 → 改写为指向保留方
+	★ v0.5 新增：合并对话链指针 prev_id / next_id：
+	   - 如果 fj 在某段对话里是某条 X 的下一句（X.next_id == fj.id），
+	     把 X.next_id 改写成 fi.id；
+	   - 如果 fj 是某条 X 的上一句（X.prev_id == fj.id），
+	     把 X.prev_id 改写成 fi.id；
+	   - 如果 fi 自己还没有 prev/next，把 fj 的对应指针接过来。
 	"""
 	if len(field) < 2:
 		return 0
@@ -128,7 +147,17 @@ def _merge(field: FissureField, cfg: NovaConfig) -> int:
 			fi.flow_count += fj.flow_count
 			fi.last_flow_time = max(fi.last_flow_time, fj.last_flow_time)
 
-			# ---- ★ 合并 outgoing_links：fj 的所有出度链接挪到 fi ----
+			# ---- 合并场景元数据 ----
+			# speaker / episode_id / turn_index：fi 已有的优先保留。
+			# 万一 fi 是没有场景的老缝隙、fj 才是新对话里的，那就把
+			# 场景信息接过来——这样合并不会丢掉对话上下文。
+			if not fi.speaker and fj.speaker:
+				fi.speaker = fj.speaker
+			if not fi.episode_id and fj.episode_id:
+				fi.episode_id = fj.episode_id
+				fi.turn_index = fj.turn_index
+
+			# ---- 合并 outgoing_links：fj 的所有出度链接挪到 fi ----
 			for tid, strength in fj.outgoing_links.items():
 				if tid == fi.id:
 					continue  # 不形成自连
@@ -138,7 +167,8 @@ def _merge(field: FissureField, cfg: NovaConfig) -> int:
 					cap=cfg.link_strength_cap,
 				)
 
-			# ---- ★ 改写所有指向 fj 的入度链接为指向 fi ----
+			# ---- 改写所有指向 fj 的入度链接为指向 fi ----
+			# 同时这一遍也顺手改写所有指向 fj 的对话链指针 prev_id / next_id。
 			for other in field._fissures.values():
 				if other.id in (fi.id, fj.id):
 					continue
@@ -149,8 +179,21 @@ def _merge(field: FissureField, cfg: NovaConfig) -> int:
 						strength_delta=strength,
 						cap=cfg.link_strength_cap,
 					)
+				if other.prev_id == fj.id:
+					other.prev_id = fi.id
+				if other.next_id == fj.id:
+					other.next_id = fi.id
+
+			# ---- 把 fj 自己的对话链指针接到 fi 上（如果 fi 还没有的话） ----
+			# 注意要避免自指：合并后链接两端不能都是 fi。
+			if fj.prev_id and fj.prev_id != fi.id and not fi.prev_id:
+				fi.prev_id = fj.prev_id
+			if fj.next_id and fj.next_id != fi.id and not fi.next_id:
+				fi.next_id = fj.next_id
 
 			# ---- 物理移除 fj ----
+			# field.remove() 会再次扫一遍，清理任何残留的指向 fj 的
+			# 暗道和对话链指针——这是兜底。
 			field.remove(fj.id)
 			consumed.add(fj.id)
 			merged_count += 1

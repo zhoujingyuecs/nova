@@ -137,6 +137,7 @@ def shell():
         })
 
     try:
+        print('bash --- ', CWD, command)
         result = subprocess.run(
             ["bash", "-lc", command],
             capture_output=True,
@@ -180,6 +181,7 @@ def python_exec():
         os.chdir(CWD)
         # 先尝试当作表达式执行（这样最后一行能自动打印结果）
         try:
+            print('python --- ', CWD, code)
             compiled = compile(code, "<nova-python>", "eval")
             value = eval(compiled, PYTHON_GLOBALS)
             if value is not None:
@@ -217,6 +219,7 @@ def web():
         url = "https://" + url
 
     try:
+        print('web --- ', url)
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) nova-vm/0.1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

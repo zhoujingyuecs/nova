@@ -1,23 +1,29 @@
 """意识水流（ConsciousnessFlow）：陶土球里那一道流动的水。
 
-这一版把"水流"从单纯的"几何贪心"改成了三种通道的混合：
+水流从三种通道里收集候选下一步：
 
   ① 几何邻域（Geometric）—— 沿着语义相似度，水会自然流向附近
                             形状像的缝隙。这是"等高线"的部分。
   ② 显式裂缝（Crack/Link）—— 跟着 fissure.outgoing_links 跳到
                             完全不相邻、但经验上常一起浮起的缝隙。
                             这是"地下暗道"的部分，让水能跨山谷。
+                            ★ 对话链（prev_id/next_id）也由非常
+                              强的暗道承担——所以 frontier 上每条
+                              缝隙的"前一句话/下一句话"几乎一定会
+                              被水流带起来。
   ③ 冷跳（Cold jump）—— 偶尔（小概率）从陶土球里抓一条很冷的、
                        很久没人想起的缝隙，强行扔到候选池里。
                        人脑不是连续可微的，偶尔有跳跃。
 
-加上"近期防扎堆"机制——
+加上"近期防扎堆"——
   外面调进来一份 recent_history，里面是最近 N 步水流走过的缝隙。
-  这些缝隙在打分时会被乘一个 <1 的折扣，避免水反复在同一区域
-  打转、也避免她翻来覆去想同一件事。这是 Nova 这边给我们的输入。
+  这些缝隙在打分时会被乘一个 <1 的折扣，避免水反复在同一区域打转。
 
-候选池里的所有候选先按分数排序，再加点高斯噪声做最终选择，水流
-不一定每次都走最优——这就是"思绪偶尔跑偏"的样子。
+★ 还有"必带锚点"（mandatory_anchors）——
+  外面调进来一组缝隙，它们会被**直接放进激活集**作为水流的起点之一，
+  不论它们和种子像不像、不论它们是否在 recent_history 里都不打折。
+  这是给"当前对话刚说过的几句话"准备的：哪怕水流自己绕错了方向，
+  这些"前几句话"也保证浮在意识里。
 """
 
 from __future__ import annotations
@@ -41,36 +47,64 @@ class ConsciousnessFlow:
 	#                       主循环
 	# ==========================================================
 	def flow(self, seed_shape: np.ndarray,
-			 recent_history: Optional[set] = None) -> list:
+			 recent_history: Optional[set] = None,
+			 mandatory_anchors: Optional[list] = None) -> list:
 		"""从 seed_shape 出发，让水流走完。返回激活的缝隙列表。
 
-		recent_history：一个 fissure_id 集合，对最近几次水流走过的
-		缝隙打折——这是为了避免反复在一个语义簇里打转。
+		recent_history：fissure_id 集合，对最近几次水流走过的缝隙打折——
+		                避免反复在一个语义簇里打转。
+		mandatory_anchors：一组 Fissure，**必须**出现在激活集里。它们：
+		                   - 会被排除在 recent_history 的打折之外；
+		                   - 会被作为初始 frontier 的一部分参与候选生成；
+		                   - 即使预算不足，也会优先放进 activated。
+		                   留空就是普通的水流。
 		"""
 		if len(self.field) == 0:
 			return []
 
 		seed_shape = _normalize(seed_shape)
-		recent_history = recent_history or set()
+		recent_history = set(recent_history or set())
+		anchors: list[Fissure] = list(mandatory_anchors or [])
+		anchor_ids = {f.id for f in anchors}
+
+		# 必带锚点不应该被打折——它们是"当前对话还在嘴边的话"
+		recent_history -= anchor_ids
 
 		visited: set = set()
 		activated: list[Fissure] = []
 		budget_left = self.cfg.flow_budget_chars
 		max_steps = self.cfg.flow_max_steps
 
-		# ---------- 第一步：选入水点 ----------
-		# 优先取离种子最像、又不在最近历史里的几条缝隙
+		# ---------- 第 0 步：先把锚点装进激活集 ----------
+		# 即便预算紧张，锚点也尽量挤进来——这是真实人脑里"刚才发生了
+		# 什么"那种背景图，丢了就成了失忆。
+		for f in anchors:
+			if f.id in visited:
+				continue
+			cost = max(len(f.content), 1)
+			# 锚点享受预算特权：哪怕剩 1 字符也塞进去（不超过 max_steps）
+			if len(activated) >= max_steps:
+				break
+			visited.add(f.id)
+			activated.append(f)
+			budget_left = max(0, budget_left - cost)
+
+		# ---------- 第一步：从种子取入水点 ----------
 		entries = self.field.nearest(
 			seed_shape,
 			k=self.cfg.flow_seed_count,
-			exclude=recent_history,
+			exclude=recent_history | visited,
 		)
-		# 兜底：如果最近历史几乎覆盖了整个场，那就放宽
+		# 兜底：如果近期历史几乎覆盖了整个场，那就放宽
 		if not entries:
-			entries = self.field.nearest(seed_shape, k=self.cfg.flow_seed_count)
+			entries = self.field.nearest(
+				seed_shape, k=self.cfg.flow_seed_count, exclude=visited,
+			)
 
 		# frontier：最近 K 步走过的缝隙，用来产生下一批候选
-		frontier: list[Fissure] = []
+		# 锚点们也算"最近走过"——所以它们的暗道（包括对话前后链）
+		# 会在第一轮候选生成时就被沿着走出去
+		frontier: list[Fissure] = list(anchors[-self.cfg.flow_frontier_size:])
 
 		for f, _sim in entries:
 			if budget_left <= 0 or len(activated) >= max_steps:
@@ -78,9 +112,13 @@ class ConsciousnessFlow:
 			cost = max(len(f.content), 1)
 			if cost > budget_left:
 				continue
+			if f.id in visited:
+				continue
 			visited.add(f.id)
 			activated.append(f)
 			frontier.append(f)
+			if len(frontier) > self.cfg.flow_frontier_size:
+				frontier.pop(0)
 			budget_left -= cost
 
 		# 当前水流位置：随种子和 frontier 一起决定
@@ -153,12 +191,12 @@ class ConsciousnessFlow:
 			push(f, sim * self.cfg.geometric_weight, "geo")
 
 		# ---- 2) 暗道：从 frontier 里每条缝隙出发，沿出度链接跳 ----
+		# （prev/next 的对话链就是非常强的暗道，会在这里被沿着走）
 		for f in frontier:
 			links = self.field.linked_targets(f.id, exclude=visited)
 			for target, strength in links:
 				# 链接分：log1p(强度) × 权重
-				# log1p 是为了压一压热点链接的影响（防止一条超强链
-				# 接把水流死死锁住）
+				# log1p 是为了压一压热点链接的影响
 				score = float(np.log1p(strength)) * self.cfg.link_weight
 				push(target, score, "link")
 

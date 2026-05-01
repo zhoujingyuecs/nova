@@ -10,23 +10,33 @@
   - flow_count：历史上有多少次水流流经此处。
   - last_flow_time：最近一次被填满的时间戳。
 
-  ★ 新增：outgoing_links —— 这道缝隙通向哪些其他缝隙的"地下通道"
+  ★ outgoing_links —— 这道缝隙通向哪些其他缝隙的"地下通道"
     -----------------------------------------------------------
-    旧版本的水流只看几何相似度（语义近不近），结果就是水容易
-    陷在一团相似的回忆里转圈，像个实心球。
-
+    单纯几何近邻有个毛病：水容易陷在一团相似的回忆里转，像个实心球。
     显式链接是为了把"陶土球"里那些**真正的裂缝**显式地刻出来——
-    两条在语义上很远的回忆，如果它们在一段经历里挨着出现过，
-    就该有一条直通的暗道。
+    两条在语义上很远的回忆，只要它们在一段经历里挨着出现过，就该
+    有一条直通的暗道。这就是"高低不平的洞穴"，让水能从一个山谷
+    流到另一个山谷，而不只是顺着等高线绕圈。
 
-    这就是"高低不平的洞穴"，让水能从一个山谷流到另一个山谷，
-    而不只是顺着等高线绕圈。
+  ★★ 这一版（v0.5）新增的"场景元数据"
+    -----------------------------------------------------------
+    旧版的缝隙只记得文本，不记得"这是谁说的、第几句话、前面那句
+    是什么"。所以 nova 想起一段记忆时，只能拿到一堆悬浮的句子，
+    构不出"谁在什么时候对我说了什么"的完整画面。
 
-    存的是 dict[target_id, strength]：
-      - 单向。A→B 不等于 B→A。
-      - 想要双向就显式存两条（A→B 和 B→A）。
-      - strength 是浮点数，可以累加：每次共同被想起就强化一次。
-      - 没有上限——但消费时我们会用 log 之类把它压一压。
+    这次给每条缝隙加上：
+      speaker     —— 谁说的：「外人」「我」「走神」 或 ""（无来源）
+      episode_id  —— 同一段连续交互的标识；同一场对话里所有缝隙共享
+      turn_index  —— 在这段交互里第几句（0,1,2,...）
+      prev_id     —— 同一段对话里紧邻的上一句
+      next_id     —— 同一段对话里紧邻的下一句
+
+    prev_id/next_id 是显式的"时间链表"——人想起一句话时，前后两句
+    经常会自然地跟着浮上来。这正是真实人脑回忆"前因后果"的方式。
+
+    这些字段是"软"的：不影响 shape，不参与几何近邻；它们只是缝隙
+    的身世标签。但 mind 在拼回忆时会读它们，渲染成"[5 分钟前·有人
+    对我说]" 这样的小标签，给 nova 还原场景。
 """
 
 from __future__ import annotations
@@ -37,6 +47,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+
+# ---- speaker 的有限集合（约定，不强校验） ----
+SPEAKER_OUTSIDER = "外人"   # 别人对她说的
+SPEAKER_SELF = "我"          # 她说出口的
+SPEAKER_DAYDREAM = "走神"    # 没人在场时她自己冒出来的念头
+SPEAKER_NONE = ""            # 种子记忆 / 抽象意象 / 工具能力 等
 
 
 @dataclass
@@ -52,10 +69,16 @@ class Fissure:
 	last_flow_time: float = field(default_factory=time.time)
 	creation_time: float = field(default_factory=time.time)
 
-	# ---------- 显式裂缝（这是这次改动的核心） ----------
-	# key: 目标缝隙的 id
-	# value: 链接强度（>0；越大越倾向走这条暗道）
+	# ---------- 显式裂缝（暗道） ----------
+	# key: 目标缝隙的 id；value: 链接强度（>0；越大越倾向走这条暗道）
 	outgoing_links: dict = field(default_factory=dict)
+
+	# ---------- ★ 场景元数据（v0.5 新增） ----------
+	speaker: str = SPEAKER_NONE  # 这条缝隙是谁说出口/想出来的
+	episode_id: str = ""         # 同一段连续交互共享的 id（""=无关联）
+	turn_index: int = 0          # 在 episode 内第几句（0 起算）
+	prev_id: str = ""            # 同一 episode 里紧邻的上一条缝隙 id
+	next_id: str = ""            # 同一 episode 里紧邻的下一条缝隙 id
 
 	def __post_init__(self):
 		# 把形状统一归一化到单位球面上，所有相似度都用余弦
@@ -121,6 +144,10 @@ class Fissure:
 
 		低于 floor 的链接被认为已经"裂开了"，从字典里删掉。
 		返回被删掉的链接数。睡眠期会用到。
+
+		⚠️ 注意：如果某条链接同时也是 prev_id/next_id 关系上的"骨架"，
+		在 sleep.py 里有专门的逻辑保护它（detach_chain 会先解开再衰减）。
+		本方法只是机械地遍历 outgoing_links，不知道也不关心 prev/next。
 		"""
 		removed = []
 		for tid in list(self.outgoing_links.keys()):
@@ -143,8 +170,13 @@ class Fissure:
 			"flow_count": self.flow_count,
 			"last_flow_time": self.last_flow_time,
 			"creation_time": self.creation_time,
-			# 链接也存下来。空 dict 也写进去，结构清晰
 			"outgoing_links": dict(self.outgoing_links),
+			# ---- 场景元数据 ----
+			"speaker": self.speaker,
+			"episode_id": self.episode_id,
+			"turn_index": self.turn_index,
+			"prev_id": self.prev_id,
+			"next_id": self.next_id,
 		}
 
 	@classmethod
@@ -158,9 +190,14 @@ class Fissure:
 			last_flow_time=d.get("last_flow_time", time.time()),
 			creation_time=d.get("creation_time", time.time()),
 		)
-		# 兼容旧存档：旧版没有 outgoing_links，给空 dict 即可
+		# 兼容旧存档：旧版没有 outgoing_links / 场景元数据，给默认值即可
 		raw_links = d.get("outgoing_links", {}) or {}
 		f.outgoing_links = {str(k): float(v) for k, v in raw_links.items()}
+		f.speaker = d.get("speaker", SPEAKER_NONE) or SPEAKER_NONE
+		f.episode_id = d.get("episode_id", "") or ""
+		f.turn_index = int(d.get("turn_index", 0) or 0)
+		f.prev_id = d.get("prev_id", "") or ""
+		f.next_id = d.get("next_id", "") or ""
 		return f
 
 

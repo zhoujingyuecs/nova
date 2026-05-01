@@ -3,15 +3,23 @@
 存档格式刻意做得朴素，方便人眼检查：
   field/
     meta.json        —— 维度、版本号、缝隙数等
-    fissures.json    —— 每条缝隙的可读字段（id、content、时间、计数、★出度链接）
+    fissures.json    —— 每条缝隙的可读字段
+                        （id、content、时间、计数、出度链接、★场景元数据）
     shapes.npy       —— 当前形状矩阵 (N, d) float32
     origins.npy      —— 出生形状矩阵 (N, d) float32
 
 shapes.npy 与 fissures.json 中的顺序严格对齐。
 
-★ 这次新增：fissures.json 里每条缝隙带上 outgoing_links。
-   旧版本的存档（没有这个字段）依然能读出来——只是所有链接为空。
-   新建立的链接会随后续的 perceive/dream 慢慢长出来。
+版本演进：
+  v1: 原始版本（无链接）
+  v2: 加上 outgoing_links 字段
+  v3: ★ 加上 speaker / episode_id / turn_index / prev_id / next_id
+       —— 缝隙现在记得"是谁说的、属于哪段对话、这段话里的第几句、
+          紧挨着的前一句和后一句是哪条"。
+
+旧存档自动兼容：v1/v2 读进来时，新字段都是空的，相当于没有场景信息——
+nova 不会因此崩溃，只是新对话开始之前，老的回忆都散在那里没有链。
+随后续的 perceive 慢慢长出新对话的链。
 """
 
 from __future__ import annotations
@@ -27,9 +35,7 @@ from .field import FissureField
 from .fissure import Fissure
 
 
-# v1：原始版本（无链接）
-# v2：加上 outgoing_links 字段
-_VERSION = 2
+_VERSION = 3
 
 
 def save_field(field: FissureField, path: Optional[str] = None) -> None:
@@ -97,29 +103,50 @@ def load_field(cfg: NovaConfig, embedding_dim: int,
 	shapes = np.load(shapes_path)
 	origins = np.load(origins_path)
 
-	# 第一遍：加载所有缝隙（带链接），构建场
+	# 第一遍：加载所有缝隙（带链接和场景元数据），构建场
 	for d, s, o in zip(fissure_dicts, shapes, origins):
 		fis = Fissure.from_dict(d, shape=s, origin_shape=o)
 		field._add_fissure(fis)
 
-	# 第二遍：清理失效链接（指向已经不存在的 id 的）
-	# 这种情况理论上不该发生，但以防万一
+	# 第二遍：清理所有失效引用——
+	#   ① 指向已不存在缝隙的 outgoing_links 暗道
+	#   ② 指向已不存在缝隙的 prev_id / next_id 对话链指针
+	# 理论上不该出现，但万一（手动改动了文件，或者并发存档）就不会崩。
 	valid_ids = set(field._fissures.keys())
-	cleaned = 0
+	cleaned_links = 0
+	cleaned_chain = 0
 	for fis in field._fissures.values():
 		for tid in list(fis.outgoing_links.keys()):
 			if tid not in valid_ids:
 				del fis.outgoing_links[tid]
-				cleaned += 1
-	if cleaned > 0:
-		print(f"⚠️ 清理了 {cleaned} 条指向不存在缝隙的失效链接")
+				cleaned_links += 1
+		if fis.prev_id and fis.prev_id not in valid_ids:
+			fis.prev_id = ""
+			cleaned_chain += 1
+		if fis.next_id and fis.next_id not in valid_ids:
+			fis.next_id = ""
+			cleaned_chain += 1
+	if cleaned_links > 0:
+		print(f"⚠️ 清理了 {cleaned_links} 条指向不存在缝隙的失效链接")
+	if cleaned_chain > 0:
+		print(f"⚠️ 清理了 {cleaned_chain} 条断裂的对话链指针")
 
 	field.sync_all()
+
 	# 简短报告一下加载情况
 	stats = field.link_stats()
+	loaded_version = meta.get("version", 1)
+	chain_nodes = stats.get("chain_nodes", 0)
 	print(
-		f"📦 缝隙场加载：{stats['node_count']} 条缝隙，"
+		f"📦 缝隙场加载（存档版本 v{loaded_version}）："
+		f"{stats['node_count']} 条缝隙，"
 		f"{stats['total_links']} 条暗道，"
-		f"平均强度 {stats['mean_link_strength']:.2f}"
+		f"其中 {chain_nodes} 条带对话链，"
+		f"平均链强度 {stats['mean_link_strength']:.2f}"
 	)
+	if loaded_version < _VERSION:
+		print(
+			f"   （从 v{loaded_version} 升级到 v{_VERSION}：旧缝隙没有场景元数据，"
+			f"新对话从此刻开始会带上 speaker / episode_id / 对话链。）"
+		)
 	return field
