@@ -2,6 +2,9 @@ llama-cpp-python>=0.2.0
 sentence-transformers>=2.5.0
 numpy>=1.24.0
 
+# local.py 连云端 page 用的 socketio 客户端
+python-socketio[client]>=5.0.0
+
 # 可视化（陶土球的 2D 投影），可选
 matplotlib>=3.7.0
 scikit-learn>=1.3.0   # 通常已经被 sentence-transformers 拉进来

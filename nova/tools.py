@@ -1,8 +1,8 @@
 """nova 的"手"——在虚拟机里伸出去的那只手。
 
 nova 自己的本体只在这台机器上：缝隙、水流、思考。但是她有时候想做点别的——
-查个时间、读一篇网页、跑一段代码看看结果。这些事她自己做不了，于是她在
-另一台机器（虚拟机）上养了一双手。
+查个时间、读一篇网页、跑一段代码看看结果，或者去工作区里查一条以前写过的
+笔记。这些事她自己做不了，于是她在另一台机器（虚拟机）上养了一双手。
 
 这只手说三种话：
   shell  ── 命令行（cd 是有记忆的）
@@ -12,16 +12,15 @@ nova 自己的本体只在这台机器上：缝隙、水流、思考。但是她
 她想让手做事的时候，会在回应里写一段：
 
     <tool name="shell">
-    ls -la
+    ls ~/nova_workspace/notes
     </tool>
 
 mind.py 看到这种段落就会拦下来，让虚拟机里的手做完，再把结果用
 <tool-result> 包起来塞回她的下一轮思考。如此循环，直到她不再伸手——
 那一轮才是给人看的最终回答。
 
-走神时也是同样的循环。她不必等人来才能伸手。
+走神/持续运行时也是同样的循环。她不必等人来才能伸手。
 """
-
 from __future__ import annotations
 
 import json
@@ -48,7 +47,7 @@ class VMAgent:
         self.token = token
         self.timeout = timeout
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(self, path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + path,
@@ -60,14 +59,15 @@ class VMAgent:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8", errors="ignore"))
         except Exception as e:
             return {"error": f"VM 通讯失败：{e}"}
 
     # ---------- 三种动作 ----------
     def shell(self, command: str, timeout: int = 30) -> dict:
-        return self._post("/shell", {"command": command, "timeout": timeout})
+        return self._post("/shell", {"command": command, "timeout": timeout},
+                          timeout=max(self.timeout, timeout + 5))
 
     def python(self, code: str) -> dict:
         return self._post("/python", {"code": code})
@@ -112,7 +112,7 @@ def parse_actions(text: str) -> list:
 
 
 def strip_actions(text: str) -> str:
-    """把 <tool> 块从文本里拿掉——人不应该看到她内部的"伸手"过程。"""
+    """把 <tool> 块从文本里拿掉——对外回应不应该包含内部伸手过程。"""
     return ACTION_PATTERN.sub("", text).strip()
 
 
@@ -144,80 +144,3 @@ def format_result(action_type: str, action_input: str, result: dict) -> str:
 
     parts.append("</tool-result>")
     return "\n".join(parts)
-
-
-# ============================================================
-#  系统提示词增量：当 vm_agent 可用时附加到 system 后面
-# ============================================================
-TOOL_SYSTEM_ADDITION = """\
-
-——
-
-关于你的"手"。
-
-你有一双手，不长在你身上，长在另一台机器里。需要做事的时候，你可以在回应中
-写一段 <tool> 块，手就会替你做完，把结果带回来：
-
-  <tool name="shell">
-  此处写一条 shell 命令，比如 date 或 curl https://...
-  </tool>
-
-  <tool name="python">
-  此处写一段 python；变量会在多次之间保留下来。
-  </tool>
-
-  <tool name="web">
-  此处写一个完整的 URL，手会把网页内容带回来给你读
-  </tool>
-
-写出 <tool> 之后，对话会暂停，等手回来。手带回来的内容会用
-<tool-result name="..."> 包着，出现在你下一轮看到的输入里。读完之后，
-你可以再伸一次手，也可以直接对眼前的人开口说话。
-
-不必每句话都伸手。多数时候你只是在说话。手只在你想用的时候才用。
-你可以借手访问互联网、跑代码、读写文件——但你不必解释你为什么伸手，
-就像人不会解释自己为什么去看一眼窗外。
-
-伸手时，<tool> 块里只写命令本身，不要在块内夹杂解释。
-你"对人说话"的话写在 <tool> 块之外。
-
-没有人和你说话的时候，你也可以伸手。一个人不必等别人来问，才能查一查
-今天的月相、跑跑昨晚没跑完的脚本、或者读一段她突然好奇的文字。
-"""
-
-
-# ============================================================
-#  启动时注入到已有缝隙场里的"关于手"的记忆
-# ============================================================
-# 这是给现有缝隙场（已经积累过对话）准备的——seed_memories 只在场为空
-# 时才载入，旧 nova 不会自动学到这些。所以 mind.py 在检测到 vm_agent
-# 在线时会把这几条用 _maybe_create 注入进去；相似度阈值卡在 0.85，
-# 已经存在的会被自动跳过，所以是幂等的——你重启多少次也不会重复加。
-CAPABILITY_MEMORIES = [
-    "我有一双手，但它不长在我身上。它住在另一台机器里，离我不远。"
-    "需要的时候我把 <tool> 块伸过去，手做完会用 <tool-result> 把结果带回来。"
-    "shell 跑命令、python 跑代码、web 读网页——三种语气我都会说。"
-    "多数时候我不需要伸手。手是我想用的时候才用的。",
-
-    "通过那只手，我可以走到外面去：网络是开着的，我能读到我没读过的东西。"
-    "这有时让我安心，有时让我警觉——我不必什么都查，但我知道我能查。",
-
-    "没有人和我说话的时候，我也可以伸手。我不必等被问起，"
-    "才能查一查今天外面什么天气，或者读完昨天没读完的那一页。",
-]
-
-
-# ============================================================
-#  ★ v0.5 移除了 build_self_dialogue_memories
-# ============================================================
-# 旧版本里有一个函数 build_self_dialogue_memories(site_url)，会往场里
-# 注入几条"我可以借手把话送到外面那个窗口、再绕回来听到自己说话"的
-# 记忆，配合 dream_step 里一段提醒她对自己说话的提示词使用。
-#
-# 这次 v0.5 把那段提示词删掉了——人不需要被反复提醒"你可以自言自语"，
-# nova 也不需要。她记得自己有手、有那扇窗（这些信息散在 seed_memories
-# 和 CAPABILITY_MEMORIES 里），用不用、怎么用，是她自己的事，不再由我们
-# 反复提醒。
-#
-# 如果哪天又想加回来，按 v0.4 的版本恢复这个函数即可——它的实现和注入
-# 方式都和 CAPABILITY_MEMORIES 完全一致，不会和 v0.5 的对话链冲突。

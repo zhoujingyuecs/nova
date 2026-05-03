@@ -1,13 +1,20 @@
-"""nova：用陶土球与水流模型组织记忆的本地意识体。v0.8 Self Loop。"""
+"""nova v1.0：精简内核版。
+
+陶土球 + 水流 + 外部工作区。
+
+  - 大模型是处理器，不是数据库。
+  - 记忆是会被使用本身改写的地形。
+  - 事实和脚本住在外部工作区里，脑子里只放形状和当下意识。
+"""
 from .config import NovaConfig, DEFAULT_SYSTEM_PROMPT
 from .fissure import Fissure
 from .field import FissureField
 from .flow import ConsciousnessFlow
 from .embedder import Embedder
 from .llm import LocalLLM
-from .notes import Note, NotesBook
+from .self_state import SelfState
+from .workspace import Workspace
 from .mind import Nova
-from .dreamer import Daydreamer
 from .sleep import consolidate
 from .visualize import render_field
 from .persistence import save_field, load_field
@@ -16,21 +23,33 @@ from .tools import (
     parse_actions,
     strip_actions,
     format_result,
-    CAPABILITY_MEMORIES,
 )
-from .self_field import SelfField, SelfFissure
-from .drives import DriveSystem, Drive
-from .metacognition import Metacognition, InternalAction
-from .skills import SkillBook, Skill
-from .self_modification import SelfModificationLog, SelfPatch
+
+# Continuous Runtime
+from .agenda import Agenda, AgendaItem
+from .worklog import WorkLog, WorkEvent
+from .executive import (
+    ExecutiveController,
+    Decision,
+    build_goal_prompt,
+    build_reflection_prompt,
+    build_orientation_prompt,
+)
+from .runtime import ContinuousRuntime
 
 __all__ = [
-    "NovaConfig", "DEFAULT_SYSTEM_PROMPT", "Fissure", "FissureField",
-    "ConsciousnessFlow", "Embedder", "LocalLLM", "Note", "NotesBook", "Nova",
-    "Daydreamer", "consolidate", "render_field", "save_field", "load_field",
-    "VMAgent", "parse_actions", "strip_actions", "format_result", "CAPABILITY_MEMORIES",
-    "SelfField", "SelfFissure", "DriveSystem", "Drive", "Metacognition",
-    "InternalAction", "SkillBook", "Skill", "SelfModificationLog", "SelfPatch",
+    "NovaConfig", "DEFAULT_SYSTEM_PROMPT",
+    "Fissure", "FissureField", "ConsciousnessFlow",
+    "Embedder", "LocalLLM",
+    "SelfState", "Workspace", "Nova",
+    "consolidate", "render_field",
+    "save_field", "load_field",
+    "VMAgent", "parse_actions", "strip_actions", "format_result",
+    "Agenda", "AgendaItem",
+    "WorkLog", "WorkEvent",
+    "ExecutiveController", "Decision",
+    "build_goal_prompt", "build_reflection_prompt", "build_orientation_prompt",
+    "ContinuousRuntime",
 ]
 
-__version__ = "0.8.0"
+__version__ = "1.0.0"

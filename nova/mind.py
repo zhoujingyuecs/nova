@@ -1,17 +1,30 @@
-"""Nova v0.8：Self Loop 直接替换版主循环。
+"""nova v1.0 主循环 —— 精简内核版。
 
-这一版把 v0.6 的“主意识短字符串”升级为 SelfField + DriveSystem：
-主意识不只是 prompt 前面的一段文本，而会参与 attention seed，改变
-普通记忆水流的入水位置。nova 的自我改进也不靠人类手动调 prompt，
-而是通过 Metacognition / SkillBook / SelfModificationLog 在运行中
-沉淀和调整。
+老版本里 perceive 一次会做四次 LLM 调用：主回应、意象拆解、主意识更新、
+笔记本更新。每次还要把 SelfField / DriveSystem / SkillBook /
+SelfModificationLog / NotesBook 五个块都渲染进 prompt，加起来 prompt
+头部经常占掉两千字符还没说一句正经话。
+
+v1.0 把它压成一次主回应 + 偶尔一次轻量级 self_state 更新。
+
+每轮 perceive 做的事：
+  1. 嵌入 stimulus
+  2. 让水流从 (stimulus + self_state) 这个混合种子出发，沿语义近邻、
+     暗道、对话链、冷跳收集激活缝隙
+  3. 拼 prompt：SelfState + 工作区索引 + 激活缝隙 + 当前对话链 + 输入
+  4. 调一次 LLM；如果回应里有 <tool> 块，让 VM 的手做完，把 result
+     填回 prompt，再调一次；最多 max_tool_iterations 次
+  5. 把回应嵌入，反向冲刷激活的缝隙；新增 stimulus / response 两条
+     缝隙到对话链
+  6. 每 cfg.self_update_every 次 perceive，触发一次轻量 self_state 更新
+  7. 自动存盘
+
+dream / think 是同样的流程，只是种子来自缝隙场内部 + self_state。
 """
 from __future__ import annotations
 
 import collections
-import json
 import os
-import random
 import re
 import threading
 import time
@@ -33,68 +46,23 @@ from .fissure import (
 )
 from .flow import ConsciousnessFlow
 from .llm import LocalLLM
-from .notes import NotesBook
 from .persistence import load_field, save_field
-from .self_field import SelfField
-from .drives import DriveSystem
-from .metacognition import Metacognition
-from .skills import SkillBook
-from .self_modification import SelfModificationLog
-from .autonomy import choose_autonomy_mode, build_dream_header
-from .tools import (
-    CAPABILITY_MEMORIES,
-    TOOL_SYSTEM_ADDITION,
-    VMAgent,
-    format_result,
-    parse_actions,
-    strip_actions,
-)
+from .self_state import SelfState, SELF_UPDATE_PROMPT, parse_self_update
+from .tools import VMAgent, format_result, parse_actions, strip_actions
+from .workspace import Workspace
 
 
 DREAM_PROMPT_BASE = (
     "[此刻你独自一人，没有谁在和你说话。你的思绪自己飘起来。]\n\n"
-    "{consciousness_block}"
+    "{state_block}"
+    "{workspace_block}"
     "[下面这些片段浮上心头——是素材，不是替代品：]\n\n"
     "{memories}\n\n"
     "[你现在脑子里在想什么？写一两句就好，像在自言自语。"
-    "主意识仍是你的主线；如果你想伸手做点什么，就伸；如果该沉淀经验，就沉淀。]"
+    "你也可以伸手做点事——查一下工作区、跑一段已有脚本、"
+    "或者把刚才领悟到的东西写成一篇笔记。]"
 )
 
-IMAGERY_EXTRACTION_PROMPT = """\
-下面这段话里包含了几个不同的“意象”——可能是一个画面、一种感受、一个想法、
-一个具体的场景或细节。请把它们按出现顺序拆出来，每行一条，每条 8~40 字。
-不要解释、不要编号。最少 1 条，最多 {max_count} 条。
-
-——— 原文 ———
-{text}
-
-——— 意象（每行一条）———"""
-
-NOTES_UPDATE_PROMPT = """\
-你正在帮 nova 维护她的“笔记本”：一份她确认知道、以后可以直接依赖的清单。
-只有明确的步骤、工具用法、重要事实、被纠正的误解、长期偏好值得记。
-一时情绪、隐喻、一次性场景不要记。多数情况下请只输出“（无变动。）”。
-
-〖当前笔记本〗
-{notes_text}
-
-〖Self Loop / 主意识〗
-{main_consciousness}
-
-〖刚刚发生〗
-{event}
-
-请输出 0~3 行动作。每行严格用以下格式之一：
-[ADD] 新笔记内容
-[UPDATE id=<id>] 修订后的内容
-[REMOVE id=<id>]
-如果没有任何要变的，只输出：
-（无变动。）
-"""
-
-_NOTES_ADD_RE = re.compile(r"^\s*\[\s*ADD\s*\]\s*(.+?)\s*$", re.IGNORECASE)
-_NOTES_UPDATE_RE = re.compile(r"^\s*\[\s*UPDATE\s+id\s*=\s*([A-Za-z0-9_]+)\s*\]\s*(.+?)\s*$", re.IGNORECASE)
-_NOTES_REMOVE_RE = re.compile(r"^\s*\[\s*REMOVE\s+id\s*=\s*([A-Za-z0-9_]+)\s*\]\s*$", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
 _OPEN_THINK_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 _CLOSE_THINK_RE = re.compile(r"</think>", re.IGNORECASE)
@@ -112,26 +80,6 @@ def _strip_think_block(text: str) -> str:
     if m:
         text = text[m.end() :]
     return text.strip()
-
-
-def _parse_notes_actions(raw: str) -> list[tuple]:
-    actions = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = _NOTES_ADD_RE.match(line)
-        if m:
-            actions.append(("add", m.group(1).strip()))
-            continue
-        m = _NOTES_UPDATE_RE.match(line)
-        if m:
-            actions.append(("update", m.group(1).strip(), m.group(2).strip()))
-            continue
-        m = _NOTES_REMOVE_RE.match(line)
-        if m:
-            actions.append(("remove", m.group(1).strip()))
-    return actions
 
 
 def _format_age(seconds: float) -> str:
@@ -157,50 +105,12 @@ class Nova:
 
         self.flow_engine = ConsciousnessFlow(self.cfg, self.field)
         self.llm = LocalLLM(self.cfg)
-        self._perceive_count = 0
-        self._recent_history = collections.deque(maxlen=self.cfg.recent_history_size)
 
-        self._current_episode_id: str = ""
-        self._last_episode_activity: float = 0.0
-        self._last_episode_fid: str = ""
-        self._current_turn_index: int = 0
-        self._main_consciousness: str = ""
+        # SelfState: 五合一的轻量自我状态
+        self._self_state_path = os.path.join(self.cfg.field_path, "self_state.json")
+        self.self_state = SelfState.load(self._self_state_path)
 
-        self._self_loop_paths = {
-            "self_field": os.path.join(self.cfg.field_path, "self_field.json"),
-            "drives": os.path.join(self.cfg.field_path, "drives.json"),
-            "skills": os.path.join(self.cfg.field_path, "skills.json"),
-            "self_modification": os.path.join(self.cfg.field_path, "self_modification.json"),
-        }
-        self.self_field = SelfField(
-            self.embedder.dim,
-            max_chars=getattr(self.cfg, "self_loop_self_max_chars_in_prompt", 1800),
-        )
-        self.drives = DriveSystem(self.embedder.dim)
-        self.metacognition = Metacognition()
-        self.skills = SkillBook(
-            path=self._self_loop_paths["skills"],
-            max_skills=getattr(self.cfg, "skills_max_total", 80),
-        )
-        self.self_modification = SelfModificationLog(
-            path=self._self_loop_paths["self_modification"],
-        )
-
-        notes_path = os.path.join(self.cfg.field_path, "notes.json")
-        self.notes = NotesBook(
-            path=notes_path,
-            max_total=self.cfg.notes_max_total,
-            max_chars_per_note=self.cfg.notes_max_chars_per_note,
-        )
-        self.notes.load()
-
-        self._restore_episode_state_from_field()
-        self._load_main_consciousness()
-        if getattr(self.cfg, "self_loop_enabled", True):
-            self._load_self_loop()
-
-        self._lock = threading.RLock()
-
+        # VM hand + workspace
         self.vm_agent: Optional[VMAgent] = None
         if self.cfg.vm_agent_url:
             agent = VMAgent(
@@ -214,10 +124,29 @@ class Nova:
             else:
                 print(f"⚠️ 虚拟机里的手没回应（{self.cfg.vm_agent_url}），这次没有手。")
 
+        self.workspace = Workspace(
+            self.vm_agent,
+            root=self.cfg.workspace_root,
+            index_ttl=self.cfg.workspace_index_ttl,
+            index_max_chars=self.cfg.workspace_index_max_chars,
+        )
+        if self.workspace.is_available:
+            self.workspace.ensure_bootstrap()
+
+        # 运行状态
+        self._perceive_count = 0
+        self._recent_history = collections.deque(maxlen=self.cfg.recent_history_size)
+        self._current_episode_id: str = ""
+        self._last_episode_activity: float = 0.0
+        self._last_episode_fid: str = ""
+        self._current_turn_index: int = 0
+
+        self._restore_episode_state_from_field()
+
+        self._lock = threading.RLock()
+
         if len(self.field) == 0 and self.cfg.seed_memories_file:
             self._load_seeds(self.cfg.seed_memories_file)
-        if self.vm_agent is not None:
-            self._ensure_capability_memories()
 
     # ==========================================================
     # 对外接口
@@ -235,20 +164,9 @@ class Nova:
                 episode_id=episode_id,
             )
 
-            imagery_fids: list[str] = []
-            if self.cfg.imagery_enabled and len(stimulus) >= self.cfg.imagery_min_input_chars:
-                try:
-                    imagery_fids = self._extract_and_link_imageries(
-                        stimulus, speaker=SPEAKER_OUTSIDER, episode_id=episode_id
-                    )
-                    for ifid in imagery_fids:
-                        self.field.link(stim_fid, ifid, strength_delta=self.cfg.imagery_link_base)
-                        self.field.link(ifid, stim_fid, strength_delta=self.cfg.imagery_link_base * 0.7)
-                except Exception as e:
-                    print(f"⚠️ 意象拆解失败（不致命，跳过）：{e}")
-
-            episode_anchors = self.field.walk_chain_back(stim_fid, k=self.cfg.episode_recall_size)
+            # 水流：种子 = stimulus + self_state 形状
             attention_seed = self._compose_attention_seed(stim_shape)
+            episode_anchors = self.field.walk_chain_back(stim_fid, k=self.cfg.episode_recall_size)
             activated = self.flow_engine.flow(
                 attention_seed,
                 recent_history=set(self._recent_history),
@@ -270,23 +188,24 @@ class Nova:
                 episode_id=episode_id,
             )
 
+            # 共激活弱链接：被一起想起的几条之间长出微弱暗道
             activated_ids = [f.id for f in activated]
-            soft_chain_ids = imagery_fids + activated_ids
-            if len(soft_chain_ids) >= 2:
+            if len(activated_ids) >= 2:
                 self.field.link_chain(
-                    soft_chain_ids,
+                    activated_ids,
                     base_strength=self.cfg.flow_coactivation_link_strength,
-                    decay=self.cfg.imagery_link_decay,
+                    decay=0.65,
                     max_distance=self.cfg.flow_coactivation_distance,
                     bidirectional=False,
                 )
-            for fid in soft_chain_ids[-self.cfg.flow_coactivation_distance:]:
-                self.field.link(fid, response_fid, strength_delta=self.cfg.flow_coactivation_link_strength)
+            for fid in activated_ids[-self.cfg.flow_coactivation_distance:]:
+                self.field.link(fid, response_fid,
+                                strength_delta=self.cfg.flow_coactivation_link_strength)
 
             self.field.sync_all()
             self._tick_autosave()
 
-            for fid in soft_chain_ids:
+            for fid in activated_ids:
                 f = self.field.get(fid)
                 if f is None:
                     continue
@@ -294,42 +213,56 @@ class Nova:
                     continue
                 self._recent_history.append(fid)
 
-            if getattr(self.cfg, "self_loop_enabled", True):
-                self._self_loop_after_perceive(
-                    stimulus=stimulus,
-                    visible=visible,
-                    stim_shape=stim_shape,
-                    response_shape=response_shape,
-                    episode_id=episode_id,
-                )
-            else:
-                self._main_consciousness = visible[: self.cfg.main_consciousness_max_chars]
-                self._save_main_consciousness()
+            # 工作区索引可能因为这一轮 nova 写过笔记/脚本而过期
+            if "<tool" in final_response.lower() and self.workspace.is_available:
+                self.workspace.invalidate()
 
-            self._update_notes_from_perceive(stimulus, visible)
+            # 偶尔更新一次 SelfState
+            self._maybe_update_self_state(stimulus, visible, agenda_text="")
+
             return visible
 
-    def dream_step(self, max_tokens: Optional[int] = None) -> Optional[str]:
-        """做一次内向活动。v0.8 中它由 DriveSystem 选择模式。"""
+    def think(self, *, max_tokens: Optional[int] = None,
+              prompt_hint: str = "") -> Optional[str]:
+        """没人说话时的一次内向活动（替代 dream_step）。
+
+        prompt_hint：可选的 prompt 前缀，runtime 在 goal_pursuit /
+        reflection / orientation 时塞进来当主线指令。"""
         with self._lock:
             if len(self.field) < 1:
                 return None
             seed_shape = self._dream_seed()
-            mode = choose_autonomy_mode(self.drives, self.self_field) if getattr(self.cfg, "self_loop_enabled", True) else "free_dream"
-            if getattr(self.cfg, "self_loop_enabled", True):
-                seed_shape = self._compose_attention_seed(seed_shape)
+            attention_seed = self._compose_attention_seed(seed_shape)
 
-            activated = self.flow_engine.flow(seed_shape, recent_history=set(self._recent_history))
+            activated = self.flow_engine.flow(
+                attention_seed,
+                recent_history=set(self._recent_history),
+            )
             if not activated:
                 return None
 
-            memories = "\n".join(f"- {self._format_recall_line(f, in_episode=False)}" for f in activated)
-            consciousness_block = self._render_consciousness_block_for_dream()
-            user_prompt = DREAM_PROMPT_BASE.format(memories=memories, consciousness_block=consciousness_block)
-            if getattr(self.cfg, "self_loop_enabled", True):
-                user_prompt = build_dream_header(mode) + user_prompt
+            memories = "\n".join(
+                f"- {self._format_recall_line(f, in_episode=False)}"
+                for f in activated
+            )
+            state_block = self.self_state.render_for_prompt(
+                max_chars=self.cfg.self_update_max_tokens * 4,
+            ) + "\n\n"
+            workspace_block = self._render_workspace_block()
+            base_prompt = DREAM_PROMPT_BASE.format(
+                memories=memories,
+                state_block=state_block,
+                workspace_block=workspace_block,
+            )
+            if prompt_hint:
+                user_prompt = prompt_hint.rstrip() + "\n\n" + base_prompt
+            else:
+                user_prompt = base_prompt
 
-            thought_raw = self._chat_with_tools(user_prompt, max_tokens=max_tokens or self.cfg.daydream_max_tokens)
+            thought_raw = self._chat_with_tools(
+                user_prompt,
+                max_tokens=max_tokens or self.cfg.daydream_max_tokens,
+            )
             thought_raw = _strip_think_block(thought_raw)
             thought = strip_actions(thought_raw).strip()
             if not thought:
@@ -340,7 +273,7 @@ class Nova:
                 self.field.link_chain(
                     activated_ids,
                     base_strength=self.cfg.flow_coactivation_link_strength * 0.7,
-                    decay=self.cfg.imagery_link_decay,
+                    decay=0.65,
                     max_distance=self.cfg.flow_coactivation_distance,
                     bidirectional=False,
                 )
@@ -349,28 +282,32 @@ class Nova:
             thought_fid = self._maybe_create(thought, thought_shape, speaker=SPEAKER_DAYDREAM)
             if thought_fid is not None:
                 for fid in activated_ids[-self.cfg.flow_coactivation_distance:]:
-                    self.field.link(fid, thought_fid, strength_delta=self.cfg.flow_coactivation_link_strength)
+                    self.field.link(fid, thought_fid,
+                                    strength_delta=self.cfg.flow_coactivation_link_strength)
 
             self.field.sync_all()
             self._tick_autosave()
             for fid in activated_ids:
                 self._recent_history.append(fid)
 
-            if getattr(self.cfg, "self_loop_enabled", True):
-                self._self_loop_after_daydream(thought=thought, thought_shape=thought_shape, mode=mode)
-            else:
-                self._main_consciousness = thought[: self.cfg.main_consciousness_max_chars]
-                self._save_main_consciousness()
+            if "<tool" in thought_raw.lower() and self.workspace.is_available:
+                self.workspace.invalidate()
+
+            self._maybe_update_self_state("（内向活动）", thought, agenda_text=prompt_hint[:200])
             return thought
 
-    def consolidate(self, prune: bool = True, merge: bool = True, decay_links: bool = True) -> dict:
+    # 兼容旧 API ——
+    def dream_step(self, max_tokens: Optional[int] = None) -> Optional[str]:
+        return self.think(max_tokens=max_tokens)
+
+    def consolidate(self, prune: bool = True, merge: bool = True,
+                    decay_links: bool = True) -> dict:
         from .sleep import consolidate as _consolidate
         with self._lock:
-            stats = _consolidate(self.field, self.cfg, prune=prune, merge=merge, decay_links=decay_links)
-            save_field(self.field)
-            self._save_main_consciousness()
-            self._save_self_loop()
-            self.notes.save()
+            stats = _consolidate(self.field, self.cfg, prune=prune,
+                                 merge=merge, decay_links=decay_links)
+            save_field(self.field, keep_backup=self.cfg.backup_keep)
+            self.self_state.save(self._self_state_path)
             return stats
 
     def visualize(self, output_path: str, method: str = "pca", **kwargs) -> Optional[str]:
@@ -380,21 +317,15 @@ class Nova:
 
     def save(self) -> None:
         with self._lock:
-            save_field(self.field)
-            self._save_main_consciousness()
-            self._save_self_loop()
-            self.notes.save()
+            save_field(self.field, keep_backup=self.cfg.backup_keep)
+            self.self_state.save(self._self_state_path)
 
     # ==========================================================
     # Prompt / LLM / tools
     # ==========================================================
-    def _system_prompt(self) -> str:
-        if self.vm_agent is not None:
-            return self.cfg.system_prompt + TOOL_SYSTEM_ADDITION
-        return self.cfg.system_prompt
-
-    def _chat_with_tools(self, initial_user: str, max_tokens: Optional[int] = None) -> str:
-        system = self._system_prompt()
+    def _chat_with_tools(self, initial_user: str,
+                         max_tokens: Optional[int] = None) -> str:
+        system = self.cfg.system_prompt
         if self.vm_agent is None:
             return self.llm.chat(system, initial_user, max_tokens=max_tokens)
 
@@ -424,7 +355,8 @@ class Nova:
         print(f"⚠️ 工具调用超过 {self.cfg.max_tool_iterations} 次，停下了。")
         return last_response
 
-    def _build_prompt(self, stimulus: str, stim_fid: str, activated: list[Fissure], episode_id: str) -> str:
+    def _build_prompt(self, stimulus: str, stim_fid: str,
+                      activated: list, episode_id: str) -> str:
         in_episode: list[Fissure] = []
         others: list[Fissure] = []
         for f in activated:
@@ -436,16 +368,11 @@ class Nova:
                 others.append(f)
 
         sections: list[str] = []
-        if getattr(self.cfg, "self_loop_enabled", True):
-            block = self._render_self_loop_prompt_header()
-            if block:
-                sections.append(block)
-        elif self._main_consciousness:
-            sections.append("[你现在的状态——你的主意识]\n" + self._main_consciousness)
+        sections.append(self.self_state.render_for_prompt())
 
-        notes_block = self._render_notes_block_for_prompt()
-        if notes_block:
-            sections.append(notes_block)
+        ws_block = self._render_workspace_block().strip()
+        if ws_block:
+            sections.append(ws_block)
 
         if others:
             block = [
@@ -472,116 +399,49 @@ class Nova:
         body = "\n\n".join(sections)
         return f"{body}\n\n[然后，他这样对你说：]\n{stimulus}"
 
-    def _render_self_loop_prompt_header(self) -> str:
-        blocks = [
-            self.self_field.render_prompt_block(max_chars=getattr(self.cfg, "self_loop_self_max_chars_in_prompt", 1800)),
-            self.drives.render_prompt_block(),
-        ]
-        if getattr(self.cfg, "skills_enabled", True):
-            skill_block = self.skills.render_prompt_block(max_chars=getattr(self.cfg, "self_loop_skills_max_chars_in_prompt", 1200))
-            if skill_block:
-                blocks.append(skill_block)
-        if getattr(self.cfg, "self_modification_enabled", True):
-            patch_block = self.self_modification.render_prompt_block()
-            if patch_block:
-                blocks.append(patch_block)
-        return "\n\n".join(b for b in blocks if b)
-
-    def _render_consciousness_block_for_dream(self) -> str:
-        if getattr(self.cfg, "self_loop_enabled", True):
-            block = self._render_self_loop_prompt_header()
-            return block + "\n\n" if block else ""
-        if self._main_consciousness:
-            return f"[你现在的状态——你的主意识]\n{self._main_consciousness}\n\n"
-        return ""
-
-    def _render_notes_block_for_prompt(self) -> str:
-        if not getattr(self.cfg, "notes_enabled", True):
+    def _render_workspace_block(self) -> str:
+        if not self.workspace.is_available:
             return ""
-        txt = self.notes.render_for_prompt(max_chars=self.cfg.notes_max_chars_in_prompt)
-        if not txt:
-            return ""
-        return "[你已经学会的事 / 你确认知道的事实]\n" + txt
+        text = self.workspace.render_for_prompt()
+        return text + "\n\n" if text else ""
 
     # ==========================================================
-    # Self Loop
+    # SelfState 更新（每 N 次 perceive 触发一次轻量 LLM 调用）
     # ==========================================================
-    def _load_self_loop(self) -> None:
-        self.self_field.load(self._self_loop_paths["self_field"])
-        self.drives.load(self._self_loop_paths["drives"])
-        self.skills.load()
-        self.self_modification.load()
-        self.self_field.ensure_bootstrap(self.embedder.embed)
-        self.drives.ensure_bootstrap(self.embedder.embed)
-        self._main_consciousness = self.self_field.render_main_text() or self._main_consciousness
-
-    def _save_self_loop(self) -> None:
-        if not getattr(self.cfg, "self_loop_enabled", True):
+    def _maybe_update_self_state(self, stimulus: str, response: str,
+                                 agenda_text: str) -> None:
+        every = max(1, self.cfg.self_update_every)
+        if (self._perceive_count % every) != 0:
             return
+        event = f"输入：{stimulus[:400]}\n回应：{response[:400]}"
+        prompt = SELF_UPDATE_PROMPT.format(
+            current_state=self.self_state.render_for_prompt(max_chars=800),
+            event=event,
+            agenda_text=agenda_text or "（无）",
+        )
         try:
-            self.self_field.save(self._self_loop_paths["self_field"])
-            self.drives.save(self._self_loop_paths["drives"])
-            if getattr(self.cfg, "skills_enabled", True):
-                self.skills.save()
-            if getattr(self.cfg, "self_modification_enabled", True):
-                self.self_modification.save()
+            raw = self.llm.chat(
+                "你是 nova 的 SelfState 维护器，只输出 FOCUS / SUMMARY / OPEN / CLOSE 控制行。",
+                prompt,
+                max_tokens=self.cfg.self_update_max_tokens,
+            )
         except Exception as e:
-            print(f"⚠️ Self Loop 存档失败（不致命）：{e}")
-
-    def _compose_attention_seed(self, input_shape: np.ndarray) -> np.ndarray:
-        if not getattr(self.cfg, "self_loop_enabled", True):
-            return input_shape
-        seed = input_shape.astype(np.float32)
-        self_shape = self.self_field.current_shape()
-        drive_shape = self.drives.current_shape()
-        seed = (
-            seed
-            + getattr(self.cfg, "self_loop_self_seed_weight", 0.55) * self_shape
-            + getattr(self.cfg, "self_loop_drive_seed_weight", 0.25) * drive_shape
-        )
-        return _normalize(seed)
-
-    def _self_loop_after_perceive(self, *, stimulus: str, visible: str, stim_shape: np.ndarray, response_shape: np.ndarray, episode_id: str) -> None:
-        self.self_field.observe_turn(
-            user_text=stimulus,
-            response_text=visible,
-            user_shape=stim_shape,
-            response_shape=response_shape,
-            episode_id=episode_id,
-            embed_fn=self.embedder.embed,
-        )
-        self.drives.observe_event(stimulus=stimulus, response=visible)
-        if getattr(self.cfg, "metacognition_enabled", True):
-            actions = self.metacognition.reflect(stimulus=stimulus, response=visible)
-            for action in actions:
-                self.self_field.apply_action(action, embed_fn=self.embedder.embed)
-                self.drives.apply_action(action, embed_fn=self.embedder.embed)
-                if getattr(self.cfg, "skills_enabled", True):
-                    self.skills.apply_action(action)
-            if getattr(self.cfg, "self_modification_enabled", True):
-                self.self_modification.observe_actions(actions, self.drives, self.skills)
-        if getattr(self.cfg, "skills_enabled", True):
-            self.skills.observe_event(stimulus=stimulus, response=visible)
-        self._main_consciousness = self.self_field.render_main_text()
-        self._save_self_loop()
-
-    def _self_loop_after_daydream(self, *, thought: str, thought_shape: np.ndarray, mode: str = "free_dream") -> None:
-        self.self_field.observe_daydream(thought, thought_shape, embed_fn=self.embedder.embed, mode=mode)
-        self.drives.observe_event(daydream=thought)
-        if getattr(self.cfg, "metacognition_enabled", True):
-            actions = self.metacognition.reflect(daydream=thought)
-            for action in actions:
-                self.self_field.apply_action(action, embed_fn=self.embedder.embed)
-                self.drives.apply_action(action, embed_fn=self.embedder.embed)
-                if getattr(self.cfg, "skills_enabled", True):
-                    self.skills.apply_action(action)
-            if getattr(self.cfg, "self_modification_enabled", True):
-                self.self_modification.observe_actions(actions, self.drives, self.skills)
-        self._main_consciousness = self.self_field.render_main_text()
-        self._save_self_loop()
+            print(f"⚠️ self_state 更新失败（不致命）：{e}")
+            return
+        raw = _strip_think_block(raw)
+        if "（无变动" in raw or "(无变动" in raw:
+            return
+        kwargs = parse_self_update(raw)
+        if not kwargs:
+            return
+        if self.self_state.apply_update(**kwargs):
+            try:
+                self.self_state.save(self._self_state_path)
+            except Exception:
+                pass
 
     # ==========================================================
-    # Episode / field helpers
+    # Episode / 对话链
     # ==========================================================
     def _get_or_start_episode(self) -> str:
         now = time.time()
@@ -590,21 +450,19 @@ class Nova:
             self._current_episode_id = uuid.uuid4().hex[:8]
             self._last_episode_fid = ""
             self._current_turn_index = 0
-            if getattr(self.cfg, "self_loop_enabled", True) and hasattr(self, "self_field"):
-                self.self_field.decay_session(getattr(self.cfg, "self_loop_episode_session_decay", 0.55))
-                self.drives.observe_event(response="新 episode 开始，短期场景退潮但核心自我保持。")
-                self._main_consciousness = self.self_field.render_main_text()
-            else:
-                self._main_consciousness = ""
             self._last_episode_activity = now
         return self._current_episode_id
 
-    def _open_episode_turn(self, content: str, shape: np.ndarray, speaker: str, episode_id: str) -> str:
-        f = self.field.add(content=content, shape=shape, speaker=speaker, episode_id=episode_id, turn_index=self._current_turn_index)
+    def _open_episode_turn(self, content: str, shape: np.ndarray,
+                           speaker: str, episode_id: str) -> str:
+        f = self.field.add(content=content, shape=shape, speaker=speaker,
+                           episode_id=episode_id, turn_index=self._current_turn_index)
         self._current_turn_index += 1
         prev_id = self._last_episode_fid
         if prev_id:
-            self.field.chain_link(prev_id, f.id, self.cfg.episode_link_forward, self.cfg.episode_link_backward)
+            self.field.chain_link(prev_id, f.id,
+                                  self.cfg.episode_link_forward,
+                                  self.cfg.episode_link_backward)
         self._last_episode_fid = f.id
         self._last_episode_activity = time.time()
         return f.id
@@ -631,44 +489,68 @@ class Nova:
         self._current_turn_index = max_idx + 1
         print(f"续上一段还没结束的对话：episode={latest_fis.episode_id}，距上次互动 {int(gap)} 秒。")
 
-    def _reshape(self, activated: list[Fissure], new_content: str, response_shape: np.ndarray) -> None:
+    # ==========================================================
+    # 缝隙场辅助
+    # ==========================================================
+    def _reshape(self, activated: list[Fissure], new_content: str,
+                 response_shape: np.ndarray) -> None:
         for f in activated:
             p = self.field.plasticity_at(f.shape)
-            f.shift_toward(response_shape, plasticity=p, new_content=new_content, rewrite_threshold=0.45)
+            f.shift_toward(response_shape, plasticity=p,
+                           new_content=new_content, rewrite_threshold=0.45)
 
-    def _maybe_create(self, content: str, shape: np.ndarray, speaker: str = SPEAKER_NONE, episode_id: str = "") -> Optional[str]:
+    def _maybe_create(self, content: str, shape: np.ndarray,
+                      speaker: str = SPEAKER_NONE,
+                      episode_id: str = "") -> Optional[str]:
         if not content.strip():
             return None
         nearest = self.field.nearest(shape, k=1)
         if nearest and nearest[0][1] >= self.cfg.create_threshold:
             return nearest[0][0].id
-        f = self.field.add(content=content, shape=shape, speaker=speaker, episode_id=episode_id)
+        f = self.field.add(content=content, shape=shape, speaker=speaker,
+                           episode_id=episode_id)
         return f.id
-
-    def _find_or_create(self, content: str, shape: np.ndarray, speaker: str = SPEAKER_NONE, episode_id: str = "") -> str:
-        fid = self._maybe_create(content, shape, speaker=speaker, episode_id=episode_id)
-        if fid is not None:
-            return fid
-        nearest = self.field.nearest(shape, k=1)
-        return nearest[0][0].id if nearest else self.field.add(content=content, shape=shape, speaker=speaker, episode_id=episode_id).id
 
     def _dream_seed(self) -> np.ndarray:
         all_f = self.field.all()
         if not all_f:
             return self.embedder.embed("我在确认自己是谁，刚才在做什么，接下来要做什么。")
+        import random
         if random.random() < 0.75:
-            recent = sorted(all_f, key=lambda f: f.last_flow_time, reverse=True)[: max(3, min(12, len(all_f)))]
+            recent = sorted(all_f, key=lambda f: f.last_flow_time,
+                            reverse=True)[: max(3, min(12, len(all_f)))]
             return random.choice(recent).shape
-        cold = sorted(all_f, key=lambda f: (f.flow_count, -f.quiet_seconds()))[: max(3, min(12, len(all_f)))]
+        cold = sorted(all_f, key=lambda f: (f.flow_count, -f.quiet_seconds()))[
+            : max(3, min(12, len(all_f)))]
         return random.choice(cold).shape
+
+    def _compose_attention_seed(self, input_shape: np.ndarray) -> np.ndarray:
+        """把输入形状和 SelfState 的形状混在一起当水流入水点。
+
+        SelfState 的形状 = identity + current_focus + recent_summary 的嵌入。
+        每次现算一次（很快），免得 SelfState 单独维护一个向量字段。"""
+        seed = input_shape.astype(np.float32)
+        weight = self.cfg.self_state_seed_weight
+        if weight <= 0:
+            return _normalize(seed)
+        try:
+            text_for_self = " ".join([
+                self.self_state.identity[:80],
+                self.self_state.current_focus[:80],
+                self.self_state.recent_summary[:80],
+            ]).strip()
+            if text_for_self:
+                self_shape = self.embedder.embed(text_for_self)
+                seed = seed + weight * self_shape
+        except Exception:
+            pass
+        return _normalize(seed)
 
     def _tick_autosave(self) -> None:
         self._perceive_count += 1
         if self.cfg.autosave_every > 0 and self._perceive_count % self.cfg.autosave_every == 0:
-            save_field(self.field)
-            self._save_main_consciousness()
-            self._save_self_loop()
-            self.notes.save()
+            save_field(self.field, keep_backup=self.cfg.backup_keep)
+            self.self_state.save(self._self_state_path)
 
     def _load_seeds(self, path: str) -> None:
         if not path or not os.path.exists(path):
@@ -679,84 +561,10 @@ class Nova:
         for c in chunks:
             self._maybe_create(c, self.embedder.embed(c), speaker=SPEAKER_NONE)
         self.field.sync_all()
-        save_field(self.field)
-
-    def _ensure_capability_memories(self) -> None:
-        for c in CAPABILITY_MEMORIES:
-            self._maybe_create(c, self.embedder.embed(c), speaker=SPEAKER_NONE)
-        self.field.sync_all()
+        save_field(self.field, keep_backup=self.cfg.backup_keep)
 
     # ==========================================================
-    # Imagery / notes
-    # ==========================================================
-    def _extract_and_link_imageries(self, text: str, speaker: str = "", episode_id: str = "") -> list[str]:
-        imageries = self._llm_extract_imageries(text)
-        if not imageries:
-            return []
-        shapes = self.embedder.embed_batch(imageries)
-        fids = []
-        for content, shape in zip(imageries, shapes):
-            fids.append(self._find_or_create(content, shape, speaker=speaker, episode_id=episode_id))
-        if len(fids) >= 2:
-            self.field.link_chain(fids, base_strength=self.cfg.imagery_link_base, decay=self.cfg.imagery_link_decay, max_distance=self.cfg.imagery_link_distance)
-        return fids
-
-    def _llm_extract_imageries(self, text: str) -> list[str]:
-        prompt = IMAGERY_EXTRACTION_PROMPT.format(text=text, max_count=self.cfg.imagery_max_count)
-        system = "你是一个把整段话拆成意象列表的工具。每行一条，不写编号、不解释。"
-        raw = self.llm.chat(system, prompt, max_tokens=self.cfg.imagery_max_tokens)
-        raw = _strip_think_block(raw)
-        items = []
-        for line in raw.splitlines():
-            line = re.sub(r"^\s*(?:[-*·•]|\d+[\.、\)）])\s*", "", line.strip())
-            if (line.startswith("「") and line.endswith("」")) or (line.startswith("\"") and line.endswith("\"")):
-                line = line[1:-1].strip()
-            if 4 <= len(line) <= 80:
-                items.append(line)
-            if len(items) >= self.cfg.imagery_max_count:
-                break
-        return items
-
-    def _update_notes_from_perceive(self, stim: str, response: str) -> None:
-        if not getattr(self.cfg, "notes_enabled", True):
-            return
-        event = f"他对我说：{stim[:600]}\n我刚刚回应：{response[:600]}"
-        prompt = NOTES_UPDATE_PROMPT.format(
-            notes_text=self.notes.render_for_update_prompt(max_chars=self.cfg.notes_max_chars_in_update_prompt),
-            main_consciousness=self._main_consciousness or self.self_field.render_main_text(),
-            event=event,
-        )
-        try:
-            raw = self.llm.chat("你是 nova 的笔记本维护器，只输出 ADD / UPDATE / REMOVE 动作。", prompt, max_tokens=self.cfg.notes_update_max_tokens)
-        except Exception as e:
-            print(f"⚠️ 笔记本更新失败（不致命）：{e}")
-            return
-        raw = _strip_think_block(raw)
-        actions = _parse_notes_actions(raw)
-        if not actions:
-            return
-        changed = []
-        for a in actions:
-            if a[0] == "add":
-                n = self.notes.add(a[1])
-                if n:
-                    changed.append(f"+ [{n.id}] {n.content}")
-            elif a[0] == "update":
-                if self.notes.update(a[1], a[2]):
-                    changed.append(f"~ [{a[1]}] {a[2]}")
-            elif a[0] == "remove":
-                if self.notes.remove(a[1]):
-                    changed.append(f"- [{a[1]}]")
-        if changed:
-            self.notes.save()
-            print("----------")
-            print(f"📓 笔记本变动（共 {len(changed)} 条，总 {len(self.notes)} 条）：")
-            for c in changed:
-                print("  " + c)
-            print("----------")
-
-    # ==========================================================
-    # Rendering / persistence helpers
+    # 渲染
     # ==========================================================
     def _format_recall_line(self, f: Fissure, in_episode: bool) -> str:
         content = self._truncate_for_recall(f.content, in_episode=in_episode)
@@ -772,7 +580,9 @@ class Nova:
         return f"{head} {content}"
 
     def _truncate_for_recall(self, text: str, in_episode: bool) -> str:
-        limit = self.cfg.episode_chain_content_max_chars if in_episode else max(self.cfg.max_fissure_chars, self.cfg.episode_chain_content_max_chars * 2)
+        limit = (self.cfg.episode_chain_content_max_chars if in_episode
+                 else max(self.cfg.max_fissure_chars,
+                          self.cfg.episode_chain_content_max_chars * 2))
         text = text.strip()
         return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
@@ -786,7 +596,8 @@ class Nova:
             return "我自己冒出来的念头"
         return ""
 
-    def _relative_position_label(self, rel: int) -> str:
+    @staticmethod
+    def _relative_position_label(rel: int) -> str:
         if rel <= 1:
             return "刚刚"
         if rel == 2:
@@ -794,27 +605,3 @@ class Nova:
         if rel == 3:
             return "上上句"
         return f"{rel - 1} 句之前"
-
-    def _main_consciousness_path(self) -> str:
-        return os.path.join(self.cfg.field_path, "main_consciousness.json")
-
-    def _load_main_consciousness(self) -> None:
-        path = self._main_consciousness_path()
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            self._main_consciousness = (d.get("main_consciousness") or "").strip()
-        except Exception as e:
-            print(f"⚠️ 主意识读取失败（忽略）：{e}")
-
-    def _save_main_consciousness(self) -> None:
-        try:
-            os.makedirs(self.cfg.field_path, exist_ok=True)
-            tmp = self._main_consciousness_path() + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"main_consciousness": self._main_consciousness, "saved_at": time.time()}, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._main_consciousness_path())
-        except Exception as e:
-            print(f"⚠️ 主意识落盘失败（不致命）：{e}")

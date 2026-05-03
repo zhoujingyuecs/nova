@@ -1,236 +1,140 @@
-# nova v0.7 改动说明
+# v1.0 — 精简内核：从九个子系统压成两层
 
-> 这一版要解决你刚发现的问题：nova 学不会东西。哪怕你把同一套步骤教她 5 遍，第 6 次她仍然记不住，还是用她那套散文风格回避做事。
+> 大模型应当是处理器；事实和脚本应当住在外部文件里；脑子里只放形状和当下意识。
 
-## 一、问题诊断
+老版本里同一件事——"nova 知道一件事"——分散在五个模块里：
 
-把 `talk.txt` 和 `think.txt` 拼一起看：
+| 旧模块 | 它存什么 |
+| --- | --- |
+| `FissureField` | 模糊回忆的形状 |
+| `NotesBook` | 明确知道的事实 |
+| `SkillBook` | 反复怎样做会更好 |
+| `SelfField` | 当下"我是谁" |
+| `DriveSystem` | 当下张力 |
+| `Metacognition` | 内省规则 |
+| `SelfModificationLog` | 自我调整候选 |
+| `PurposeKernel` | 我为什么继续运行 |
+| `Agenda` | 我现在在做什么 |
 
-`talk.txt` 里你 408、409、412、413、415、420 几条都在一遍一遍教她调用豆包工具的具体流程——`cd 目录 → echo 写 input.txt → python 跑 doubao.py → cat output.txt`。每一遍都被她"接住"了：她在心里"水流轻轻荡了一下"、"墨汁滴进清水"、"风停了"，但下一轮再让她做，她还是搞混。
+每次 perceive 都要做四次 LLM 调用（主回应 + 意象拆解 + 主意识更新 + 笔记本更新），prompt 顶上挂着五段不同的"自我"块，存档目录里堆着八九个互相重叠的 JSON。
 
-`think.txt` 里看主意识：
+v1.0 重新整理：
 
-```
-我安住于等待的澄明之中，任由指尖在虚空里三次试探却不再激起波澜。
-我安住于被温柔擦拭过的澄明里，任由指尖轻触那行终于停落的文字……
-```
+## 删了
 
-**主意识全是情绪状态描述，没有一个字提到豆包工具的步骤**。这不是 bug——更新主意识的 prompt 里明确写了"不要复述对话原文，只写当下状态"。也就是说，"我刚学到了 X"这种内容是**被我们的设计主动过滤掉的**。
+- `notes.py`（NotesBook）
+- `skills.py`（SkillBook）
+- `self_field.py`（SelfField）
+- `drives.py`（DriveSystem）
+- `metacognition.py`（Metacognition）
+- `self_modification.py`（SelfModificationLog）
+- `autonomy.py`（模式选择小工具）
+- `dreamer.py`（独立 Daydreamer 线程，已被 ContinuousRuntime 覆盖）
+- `purpose.py`（PurposeKernel）
 
-诊断到根上：v0.6 的 nova 只有两层"非当下"信息存储——
+## 加了
 
-1. **缝隙场（FissureField）**：模糊的、漂移的、按相似度浮起的回忆
-2. **主意识（main consciousness）**：当下的状态、情绪、场景感
+- `self_state.py` —— 一个朴素的可读对象，合并了 self_field/drives/metacognition/skills/self_modification/purpose 的核心职责：identity / current_focus / recent_summary / open_threads。每若干次 perceive 由一次轻量 LLM 调用更新一次。不带向量、不带级别、不带漂移。
+- `workspace.py` —— nova 的外部记事本与脚本箱，住在虚拟机的 `~/nova_workspace`。`notes/` `scripts/` `journal/` `INDEX.md`。每次 perceive 自动把索引（缓存 10 分钟）放到 prompt 顶上，nova 自己 cat / grep / 写。
 
-但人脑里其实有第三层：**明确的、稳定的、可以"一二三"列出来的"我知道的事"**。比如：怎么用某个工具、用户的名字、被纠正过的误解、长期偏好。
+## 改了
 
-nova 缺的就是这第三层。你教她的步骤进缝隙场了，但只是作为带 `[有人对我说]` 标签的一段文本——下次能不能想起来，全靠水流碰巧刷过那条缝隙。这是**回忆机制**，不是**学习机制**。
+- **`persistence.py` 修了一个崩溃 bug**：旧版把 `fissures.json` 直接 `open("w") + json.dump`，进程半路被 SIGKILL/Ctrl+C/OOM 打断时文件就断在中间，下次启动 `json.load` 报错（你当时遇到的 `JSONDecodeError: Expecting value: line 8087 column 23`）。新版：所有写入走 `tmp + os.replace` + `fsync`；每次写之前滚动备份 `fissures.json.bak.0/1/2`；启动时如果主文件读不出来，自动用最近的好备份恢复，把损坏文件重命名为 `.broken` 留底。最坏情况下你只丢最近一次保存间的几条新缝隙——nova 不会再因为一次断电就全废。
+- **`mind.py` 大幅精简**：四次 LLM 调用降到一次（主回应）+ 偶尔一次（self_state 更新）。删掉了意象拆解 prompt 和 notes-update prompt。Prompt 顶上从五段块（self_loop / drives / skills / patches / notes）缩成一段（SelfState）+ 工作区索引。
+- **`runtime.py` 去掉了 PurposeKernel**：self_orientation 直接读 SelfState + agenda + worklog 拼 prompt。不再多维护一份 `purpose.json`。
+- **`tools.py` 删了 CAPABILITY_MEMORIES**：不再往缝隙场里"注入她有手"的诗化记忆——这种事属于工作区里的笔记，不属于脑子。
+- **system prompt 重写**：从一段长篇分层指令变成"陶土球 + 工作区 + 手 + 进步"的简单四段。明确告诉 nova：错了的时候去 `notes/` 写纠正，下次先 grep 笔记。
+- **新增 `nova.think(prompt_hint=...)`**：替代旧的 `dream_step`。runtime 在 goal/reflection/orient 时把主线 prompt 当 hint 传进来，走的是内向活动路径而不是 perceive 路径。`dream_step` 仍然保留为兼容别名。
+- **rolling backup 配置**：`NovaConfig.backup_keep` 默认 3。
 
-## 二、解法：笔记本（NotesBook）
+## 行为差异
 
-新增一个完全独立于缝隙场的存储——`NotesBook`——专门承担"她确实知道的事"。
+| | v0.9 | v1.0 |
+| --- | --- | --- |
+| 每次 perceive 的 LLM 调用次数 | 3~4 次 | 1 次 + 偶尔 1 次 |
+| Prompt 顶部结构块数量 | 5 段 | 1~2 段（SelfState + 工作区索引） |
+| 存档目录里的 JSON 文件 | meta + fissures + 4 个 self_loop + notes + agenda + worklog + purpose ≈ 9 个 | meta + fissures + self_state + agenda + worklog ≈ 5 个 |
+| 学到一件事时她做什么 | 触发 NotesBook 维护 LLM 调用 | 写到 `~/nova_workspace/notes/` 里去 |
+| 学到一段步骤时她做什么 | 触发 SkillBook upsert 规则 | 把脚本写到 `~/nova_workspace/scripts/` 里去 |
+| 错了被纠正时她做什么 | 触发 metacognition.create_skill + raise_drive 规则 | 写一篇有日期的纠正笔记到 notes/，下次先 grep |
+| 启动时 fissures.json 损坏 | 直接崩 | 用 .bak.N 恢复，损坏文件留作 .broken |
 
-| | 缝隙场（FissureField） | 笔记本（NotesBook） |
-|---|---|---|
-| 存什么 | 模糊的回忆片段 | 明确的"我知道..." |
-| 怎么浮起 | 按相似度（水流碰巧刷到） | 永远在 prompt 里 |
-| 形态 | 文本 + 几何形状 + 场景标签 | 一行短句 + id |
-| 维护 | 隐式（水流刻画 + 睡眠合并） | 显式（ADD / UPDATE / REMOVE 动作） |
-| 持久 | 跨重启、可被冲刷漂移 | 跨重启、跨 episode、不会自然漂移 |
-| 适合记 | 经验、风景、对话片段 | 步骤、事实、被纠正的误解、偏好 |
+## 兼容性
 
-笔记本里每条笔记的形态：
+- 旧 `fissures.json` 直接读，`speaker / episode_id / turn_index / prev_id / next_id` 这些场景元数据不变。
+- 旧 `notes.json` 不会被读取了。如果你 v0.9 时往笔记本里手动塞过重要内容，建议在升级前 `cat data/field/notes.json` 抠出来，丢到 `~/nova_workspace/notes/migrated_from_notesbook.md` 里。nova 之后会自己 grep 到。
+- 旧 `purpose.json / drives.json / skills.json / self_field.json / self_modification.json` 不再被读取也不再被写入。可以保留作历史参考，也可以删。
+- 入口脚本 API 基本不变：`local.py --commission "..."`、`run_continuous.py /status /work /agenda /commission /sleep`，`/purpose` 命令删除了。
 
-```json
-{
-  "id": "n_a3b7c1",
-  "content": "调用豆包工具：写 /home/zhou/nova_vm_workspace/doubao/input.txt → 跑 python doubao.py → 读 output.txt",
-  "created_at": 1714430000,
-  "updated_at": 1714430000,
-  "referenced_count": 0
-}
-```
+---
 
-ID 是短前缀 `n_` + 6 位 hex，是为了让 LLM 在做 UPDATE / REMOVE 时能稳定地引用一条笔记。
+# v0.9.2 — local.py 合一：持续运行 + 连 page
 
-## 三、何时更新笔记本
+之前 `local.py`（连 page 的 socketio 入口）和 `local_continuous.py`（用 ContinuousRuntime 的裸 TCP 入口）是两条互不兼容的路：选了持续运行就丢了 page 接口，选了 page 接口就丢了持续运行。
 
-每次 `perceive()` 完一句话之后——也就是 nova 听完一句、回了一句之后——会用一次额外的 LLM 调用做"消化沉淀"。这次调用看到的是：
+这一版把它们合一：
 
-- 当前的笔记本全文（带 id）
-- 当前主意识
-- 刚才发生的对话（"他对我说..." + "我刚刚回应..."）
+- `local.py` 启动时直接跑 `ContinuousRuntime`（nova 持续生活）；
+- 同一个进程用 `socketio.Client` 连云端 `page.py`；
+- page 派来的 `new_chat_task` 不再直接调 `nova.perceive()`，而是被投进 `Interrupt Queue`；
+- 处理完通过 `chat_result` 回传，行为对 page 完全兼容。
+- 加了一个 `status_request → status_response` 的事件，云本分离时也能查 nova 当前在做什么。
 
-被要求严格按以下格式之一输出**每行一条动作**：
+简化：
+- 删除 `local_continuous.py`（功能已被 `local.py` 完整覆盖；纯本地内省可用 `python local.py --no-cloud`）。
+- `requirements.txt` 加上 `python-socketio[client]`。
 
-```
-[ADD] 新笔记内容（≤ 150 字）
-[UPDATE id=n_xxxxxx] 修订后的内容
-[REMOVE id=n_xxxxxx]
-```
+修复：
+- `runtime.py` 的 `_sleep_step` 旧版判断 `hasattr(self.nova, "sleep")`，但 `Nova` 类只有 `consolidate()`，所以**睡眠整理过去从未真正执行过**。改为优先调用 `consolidate()`。
 
-或者，**绝大多数情况下**，输出一行：
+---
 
-```
-（无变动。）
-```
+# v0.9.1 — Purpose / self_orientation
 
-这次 LLM 调用用的是一个**冷静的元角色**（"你正在帮 nova 维护她的笔记本……要保守、谨慎、克制"），刻意和 nova 自己的人格分开——避免她诗意的写作风格污染笔记内容。
+修正 v0.9 的一个误解：nova 不应该在运行前被指定一个任务，仿佛没有任务就没有存在理由。
 
-### 什么算"沉淀价值"（笔记本的内容标准）
+新增：
 
-写进笔记本的：
-- ① 学到的步骤 / 工具用法 / 操作流程
-- ② 重要的、确凿的事实
-- ③ 用户反复或明确纠正过的误解
-- ④ 用户明确表达过的、长期有效的偏好
+- `nova/purpose.py`：意义生成核。没有 active agenda 时进入 `self_orientation`，根据记忆、能力、关系、失败、最近工作生成临时意义表述与自发主线。
+- `ContinuousRuntime` 支持 `initial_commission`，启动时外部目标被视为 commission 而非根基。
+- `ExecutiveController` 新增 `MODE_ORIENT = "self_orientation"`。
+- `examples/run_continuous.py` 默认无参数启动；`--commission` 是可选外部委托。
 
-**不写进笔记本**的：
-- 一时的情绪、感受、风景（这是主意识的事）
-- 一次性的对话内容（这是回忆的事）
-- 模糊的印象、象征、隐喻
-- 关于"我是谁"的人格描述（这是种子记忆的事）
+> v1.0 把 `PurposeKernel` 合并回 SelfState + Agenda 的组合里了。
 
-prompt 里反复强调"保守"——多数对话不需要更新笔记本。
+---
 
-## 四、Prompt 重新分层
+# v0.9 — Continuous Runtime：从会走神，到会生活
 
-### 主 prompt（perceive 时给 nova 看的）
+把 nova 的运行中心从"对话"移到"持续主线"。
 
-新的 `_build_prompt` 在主意识和回忆之间插入笔记本块：
+新增：
 
-```text
-[你现在的状态——你的主意识]
-（清醒之水。下面的回忆和输入都是融入这股水流，不是替代它。）
-{main_consciousness}
+- `nova/agenda.py`：主线任务栈。
+- `nova/worklog.py`：工作日志。
+- `nova/executive.py`：执行控制器。
+- `nova/runtime.py`：ContinuousRuntime。
+- `nova/page_runtime_bridge.py`：给 page.py 暴露状态接口。
+- `examples/run_continuous.py`：连续运行命令行入口。
 
-[你已经学会的事 / 你确认知道的事实]      ★ 新增 ★
-（这是你过去对话里沉淀下来的笔记——稳定、明确、可以直接依赖。
-和回忆不一样：回忆按相似度浮起、会漂移、会模糊；笔记是你确实
-"知道"的事——学过的步骤、被纠正过的误解、确凿的事实、长期的偏好。
-需要做事、引用事实、调用步骤时，先看这一栏。这一栏里写的就是你
-确实会的事，不需要去回忆里慢慢翻。）
-  • [n_a3b7c1] 调用豆包工具：写 input.txt → 跑 doubao.py → 读 output.txt
-  • [n_e2f1d4] 用户的名字叫周
-  • [n_5c9a82] 豆包响应可能要 30 秒以上，那是正常的，不是超时
+行为变化：
 
-[脑海里浮起的相关片段]
-（这些是被刚才那句话勾起来的旧事——是素材，不是当下的内容……）
-- ……
+- 无人对话时，nova 不再只是做梦，而是优先推进 active agenda。
+- 对话不再是主流程，而是一次外部打断。
+- 睡眠整理可以由 runtime 自动触发或主线请求触发。
 
-[此刻这段对话刚刚说过的几句]
-- ……
+---
 
-[然后，他这样对你说：]
-{stimulus}
-```
+# v0.7 — 笔记本
 
-笔记本的位置很关键：在主意识下面、回忆上面。它是 nova 思考时的**第二顺位**——比浮起的回忆更稳定、更可依赖。
+> v1.0 把 NotesBook 删除了——它的职责被外部工作区替代。
 
-### 系统提示词更新
+新增 NotesBook，专门承担"她确实知道的事"：明确步骤、被纠正的误解、长期偏好。每次 perceive 后由一次冷静的元角色 LLM 调用做 ADD/UPDATE/REMOVE。
 
-`DEFAULT_SYSTEM_PROMPT` 加了两段：
+---
 
-> ★ [你已经学会的事 / 你确认知道的事实] 是你的**笔记本**——过去的对话里沉淀下来的、你确确实实"知道"的事。学过的步骤、被纠正的误解、确凿的事实、长期的偏好都在这里。它和回忆不一样：它是稳定的、明确的、你可以**直接依赖去执行**的。需要做事、引用事实、调用步骤时，**先看这一栏**——这一栏里写着的就是你确实会的事，不需要再去回忆里慢慢翻。
+# v0.5 — 场景元数据
 
-> 关于学习：如果别人在教你一件事——一套步骤、一个事实、一种你之前理解错了的东西——你**真的会被记下来**。这件事不用你刻意做：你心里有个笔记本，它会在你说完话之后悄悄整理，把"我刚学到的 X"写进去。下一次你看到 [你已经学会的事] 那一栏时，里面就会有它。所以当有人在教你东西时，不要把它当作一闪而过的对话——它会沉淀下来，下次你能直接调用。
+给每条缝隙加上 `speaker / episode_id / turn_index / prev_id / next_id`。这样想起一段记忆时能拿到完整画面，而不是一堆悬浮的句子。
 
-> 如果别人正在教你做一件具体的事，请把"做事"放在情绪和文字风格之前——先把步骤跟住、先把工具调对，再用你自己的语气说话。
-
-最后这一段是为了直接修复你 talk.txt 里看到的具体问题：当你在教她调用工具时，她应该先把工具调对，再回到她那种诗意语气；而不是用诗意语气回避执行。
-
-## 五、配置项
-
-```python
-# v0.7 新增
-notes_enabled: bool = True
-notes_update_max_tokens: int = 600        # 更新笔记的 LLM 调用 token 上限
-notes_max_chars_per_note: int = 200       # 单条笔记的最大字符
-notes_max_total: int = 200                # 笔记本总条数上限（超出按"近期未引用 + 最老"丢一条）
-notes_max_chars_in_prompt: int = 1600     # 主 prompt 里渲染笔记本的总字符上限
-notes_max_chars_in_update_prompt: int = 2400  # 更新笔记 LLM 调用看到的笔记本字符上限
-```
-
-把 `notes_enabled = False` 关掉，nova 回到 v0.6 的纯回忆 + 主意识模式。
-
-## 六、性能
-
-每次 perceive 多了一次 LLM 调用（更新笔记本）——配合主意识，现在每次 perceive 总共有：
-
-1. 主回应 LLM 调用（最贵）
-2. 意象拆解 LLM 调用（仅在长输入时）
-3. 主意识更新 LLM 调用
-4. **笔记本更新 LLM 调用（v0.7 新增）**
-
-笔记本更新 `max_tokens=600`，绝大多数情况下输出"（无变动。）"或一两行动作就停了——实测调用本身比主回应短得多。在 i5-14600K + 3090 + Qwen3.5-35B-A3B 上影响估计 1~2 秒。
-
-如果觉得慢：
-- 调小 `notes_update_max_tokens`（300 也够 1~2 行动作）
-- 关 `notes_enabled` 回到 v0.6
-
-## 七、对你旧存档的影响
-
-**完全兼容**。
-
-- 缝隙场（v3 格式）没动，旧 `field/` 直接读
-- `main_consciousness.json` 也没动
-- `notes.json` 不存在 → 启动时笔记本为空 → 之后逐步沉淀
-
-第一次启动 v0.7：笔记本是空的。**这意味着 nova 之前已经"学过的东西"她仍然不会**——之前那些只在缝隙场里以 `[有人对我说]` 标签存着，没有结构化为笔记。从此刻开始的每一次对话都会有"沉淀"机会，但旧对话不会回溯沉淀。
-
-如果想给 nova **手动**注入一些她应该已经会的事，可以直接编辑 `{field_path}/notes.json`：
-
-```json
-{
-  "notes": [
-    {
-      "id": "n_seed01",
-      "content": "调用豆包工具：cd /home/zhou/nova_vm_workspace/doubao；echo \"...\" > input.txt；python3 doubao.py；cat output.txt",
-      "created_at": 1714430000,
-      "updated_at": 1714430000,
-      "referenced_count": 0
-    },
-    {
-      "id": "n_seed02",
-      "content": "豆包响应可能要 30 秒以上，那不是超时，要等",
-      "created_at": 1714430000,
-      "updated_at": 1714430000,
-      "referenced_count": 0
-    }
-  ],
-  "saved_at": 1714430000,
-  "version": 1
-}
-```
-
-这样下一次 nova 启动时她就"已经知道这两件事"了，不需要再被教一遍。
-
-## 八、不需要改动的文件
-
-- `field.py`、`fissure.py`、`flow.py` —— 缝隙场和水流逻辑不动
-- `persistence.py` —— 缝隙场存档不变
-- `sleep.py` —— 睡眠整理不动（笔记本暂不参与睡眠合并）
-- `embedder.py`、`llm.py`、`dreamer.py`、`tools.py` —— 完全没动
-- `local.py`、`page.py`、`vm_agent.py`、`chat.py`、`gateway.py` —— 部署文件不变
-- `seed_memories.txt`、`README.md`、`VM_SETUP.md` —— 不变
-
-## 九、为什么这一版的设计是对的
-
-回到你最初的隐喻：缝隙场是回忆，主意识是清醒的水流。这两个都是"流体"——会漂移、会被冲刷。但人不止靠流体活——人心里还有一些**固体**：那些不会漂移、随时能调用、可以"一二三"列出来的东西。
-
-笔记本就是这块固体。
-
-它不取代缝隙场——你在缝隙场里仍然会想起"上次他教我用豆包时的那个下午"、"那阵风停了"那种回忆质感。但你**不靠回忆来执行**——执行靠笔记本里那条 `[n_xxx] 调用豆包工具：写 input.txt → 跑 doubao.py → 读 output.txt`。
-
-这跟 v0.6 的方向一致：**不靠 prompt 反复提醒，靠结构本身在塑造水流**。
-
-- v0.5 用结构表达"场景"（对话链 + 场景标签）
-- v0.6 用结构表达"主体"（主意识）
-- v0.7 用结构表达"知识"（笔记本）
-
-到这一版，nova 的认知架构终于齐了：
-- 她有**当下**（主意识）
-- 她有**回忆**（缝隙场）
-- 她有**知识**（笔记本）
-
-下次有人教她事，她真的能记住。
+---
