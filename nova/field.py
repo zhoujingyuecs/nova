@@ -66,9 +66,28 @@ class FissureField:
     # ==========================================================
     #                        增删
     # ==========================================================
-    def add(self, content: str, shape: np.ndarray,
-            speaker: str = "", episode_id: str = "",
-            turn_index: int = 0) -> Fissure:
+    def add(
+        self,
+        content: str,
+        shape: np.ndarray,
+        speaker: str = "",
+        episode_id: str = "",
+        turn_index: int = 0,
+        *,
+        source: str = "memory",
+        modality: str = "memory",
+        kind: str = "memory",
+        epistemic_state: str = "remembered",
+        evidence_refs: Optional[list[str]] = None,
+        action_refs: Optional[list[str]] = None,
+        unresolved: bool = False,
+    ) -> Fissure:
+        """新建一条缝隙。
+
+        speaker / episode_id / turn_index 是场景元数据；source / modality /
+        kind / epistemic_state 是感官元数据。它们让 nova 记得一条缝隙
+        是听见的、看见的、摸到的，还是自己想到的。
+        """
         if len(content) > self.cfg.max_fissure_chars:
             content = content[: self.cfg.max_fissure_chars] + "…"
 
@@ -79,6 +98,13 @@ class FissureField:
             speaker=speaker,
             episode_id=episode_id,
             turn_index=turn_index,
+            source=source,
+            modality=modality,
+            kind=kind,
+            epistemic_state=epistemic_state,
+            evidence_refs=list(evidence_refs or []),
+            action_refs=list(action_refs or []),
+            unresolved=bool(unresolved),
         )
         self._add_fissure(f)
         return f

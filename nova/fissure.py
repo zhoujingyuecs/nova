@@ -25,6 +25,14 @@
     prev_id     —— 同一段对话里紧邻的上一句
     next_id     —— 同一段对话里紧邻的下一句
 
+  感官 / 现实元数据：
+    source          —— 这段内容来自哪里：user/self/tool/memory/runtime
+    modality        —— 它像哪种感官：hearing/seeing/touching/inner_speech...
+    kind            —— request/observation/thought/response/error...
+    epistemic_state —— observed/imagined/unverified/verified/error...
+    evidence_refs   —— 如果它指向外部世界，证据 URL / 文件 / action id 放这里
+    unresolved      —— 外部请求是否仍未完成
+
     这些字段是"软"的：不影响 shape，不参与几何近邻；它们只是缝隙
     的身世标签。但 mind 在拼回忆时会读它们，渲染成"[5 分钟前·有人
     对我说]"这样的小标签，给 nova 还原场景。
@@ -68,6 +76,15 @@ class Fissure:
     turn_index: int = 0
     prev_id: str = ""
     next_id: str = ""
+
+    # ---------- 感官 / 现实元数据 ----------
+    source: str = "memory"
+    modality: str = "memory"
+    kind: str = "memory"
+    epistemic_state: str = "remembered"
+    evidence_refs: list[str] = field(default_factory=list)
+    action_refs: list[str] = field(default_factory=list)
+    unresolved: bool = False
 
     def __post_init__(self):
         # 把形状统一归一化到单位球面上，所有相似度都用余弦
@@ -152,6 +169,14 @@ class Fissure:
             "turn_index": self.turn_index,
             "prev_id": self.prev_id,
             "next_id": self.next_id,
+            # ---- 感官 / 现实元数据 ----
+            "source": self.source,
+            "modality": self.modality,
+            "kind": self.kind,
+            "epistemic_state": self.epistemic_state,
+            "evidence_refs": list(self.evidence_refs),
+            "action_refs": list(self.action_refs),
+            "unresolved": self.unresolved,
         }
 
     @classmethod
@@ -172,6 +197,13 @@ class Fissure:
         f.turn_index = int(d.get("turn_index", 0) or 0)
         f.prev_id = d.get("prev_id", "") or ""
         f.next_id = d.get("next_id", "") or ""
+        f.source = d.get("source", "memory") or "memory"
+        f.modality = d.get("modality", "memory") or "memory"
+        f.kind = d.get("kind", "memory") or "memory"
+        f.epistemic_state = d.get("epistemic_state", "remembered") or "remembered"
+        f.evidence_refs = [str(x) for x in (d.get("evidence_refs", []) or []) if x]
+        f.action_refs = [str(x) for x in (d.get("action_refs", []) or []) if x]
+        f.unresolved = bool(d.get("unresolved", False))
         return f
 
 
