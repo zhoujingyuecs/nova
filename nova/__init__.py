@@ -53,3 +53,10 @@ __all__ = [
 ]
 
 __version__ = "1.0.0"
+
+
+# v1.1 public state helpers
+try:
+    from .task_state import TaskLedger, TaskState, Evidence
+except Exception:  # keep package import tolerant during partial installs
+    pass

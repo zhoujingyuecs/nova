@@ -216,6 +216,9 @@ class ContinuousRuntime(threading.Thread):
         ss = getattr(self.nova, "self_state", None)
         if ss is not None:
             data["self_state"] = ss.to_dict()
+        task_ledger = getattr(self.nova, "task_ledger", None)
+        if task_ledger is not None:
+            data["task_state"] = task_ledger.to_dict()
         return data
 
     def status_text(self) -> str:
@@ -228,6 +231,11 @@ class ContinuousRuntime(threading.Thread):
             f"nova runtime: mode={mode}, ticks={ticks}, pending_interrupts={pending}",
             f"当前主线：{current}",
         ]
+        task_state = state.get("task_state") or {}
+        active_task = task_state.get("active_task")
+        if active_task:
+            parts.append(f"当前用户任务：{active_task.get('goal', '')[:200]} [{active_task.get('status', '')}]")
+        
         ss = state.get("self_state")
         if ss:
             parts.append("")
@@ -335,6 +343,10 @@ class ContinuousRuntime(threading.Thread):
         except queue.Empty:
             return
 
+        task_ledger = getattr(self.nova, "task_ledger", None)
+        if task_ledger is not None:
+            task_ledger.observe_user_message(intr.text)
+        
         if intr.as_agenda:
             item = self.agenda.add_if_absent(
                 intr.text[:80],

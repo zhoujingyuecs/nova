@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--task-timeout",
         type=float,
-        default=300.0,
+        default=1200.0,
         help="单次外部打断的最长等待秒数",
     )
     p.add_argument(

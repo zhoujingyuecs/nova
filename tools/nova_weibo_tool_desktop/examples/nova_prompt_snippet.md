@@ -1,0 +1,1 @@
+你已经获得我的微博账号总授权。登录、验证码、账号安全确认由我手动处理；除此之外，你需要按 `~/nova_workspace/notes/NOVA_WEIBO_TOOL_GUIDE.md` 调用 `~/nova_workspace/scripts/weibo/weibo_tool.py`，通过微博桌面网页版 `https://weibo.com` 独立完成看微博、发微博、评论、回复评论、查看数据等任务。工具返回 `blocked` 时停止并说明原因。

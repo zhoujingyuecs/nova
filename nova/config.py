@@ -97,7 +97,8 @@ class NovaConfig:
     # ============================================================
     model_path: str = os.environ.get(
         "NOVA_MODEL_PATH",
-        "/home/zhou/shared/model/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
+        # "/home/zhou/shared/model/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
+        "/home/zhou/shared/model/Qwen3.6-27B-Q4_K_M.gguf",
     )
     n_ctx: int = 65536
     n_gpu_layers: int = 99
@@ -193,6 +194,11 @@ class NovaConfig:
     vm_agent_token: str = os.environ.get("NOVA_VM_TOKEN", "nova-vm-secret-please-change-me")
     max_tool_iterations: int = 6
     vm_request_timeout: float = 60.0
+    # v1.1: generic tool-loop guard. These do not encode any specific task.
+    tool_guard_max_same_action: int = 2
+    tool_guard_max_same_error: int = 2
+    tool_guard_max_repeated_response: int = 2
+    task_state_prompt_enabled: bool = True
 
     # 工作区根目录（在 VM 上）。nova 自己写的笔记/脚本/日志住在这里。
     workspace_root: str = os.environ.get("NOVA_WORKSPACE_ROOT", "~/nova_workspace")

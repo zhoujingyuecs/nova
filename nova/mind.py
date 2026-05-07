@@ -60,6 +60,8 @@ from .perception import (
 )
 from .self_state import SelfState, SELF_UPDATE_PROMPT, parse_self_update
 from .tools import VMAgent, format_result, parse_actions, strip_actions
+from .task_state import TaskLedger, TASK_SYSTEM_ADDITION
+from .tool_guard import ToolLoopGuard
 from .workspace import Workspace
 
 
@@ -125,6 +127,10 @@ class Nova:
         self._reality_state_path = os.path.join(self.cfg.field_path, "reality_state.json")
         self.reality_state = RealityState.load(self._reality_state_path)
 
+        # v1.1: active_user_task + evidence ledger.
+        self._task_state_path = os.path.join(self.cfg.field_path, "task_state.json")
+        self.task_ledger = TaskLedger.load(self._task_state_path)
+
         # VM hand + workspace
         self.vm_agent: Optional[VMAgent] = None
         if self.cfg.vm_agent_url:
@@ -174,6 +180,7 @@ class Nova:
             # 外部输入先变成“听见的东西”，再进入裂缝场。
             # 这样 nova 记得：这是对方说的，不是自己想到的。
             stim_percept = self.reality_state.hear_user(stimulus, speaker="周靖越")
+            self.task_ledger.observe_user_message(stimulus)
 
             stim_shape = self.embedder.embed(stimulus)
             stim_fid = self._open_episode_turn(
@@ -201,6 +208,7 @@ class Nova:
             final_response = self._chat_with_tools(user_prompt)
             final_response = _strip_think_block(final_response)
             visible = strip_actions(final_response).strip() or "（沉默。）"
+            visible = ToolLoopGuard.compact_visible_text(visible)
 
             response_percept = self.reality_state.notice_self_response(visible)
 
@@ -250,6 +258,7 @@ class Nova:
             # 偶尔更新一次 SelfState；现实感每轮都轻量落盘，避免未完成请求丢失。
             self._maybe_update_self_state(stimulus, visible, agenda_text="")
             self.reality_state.save(self._reality_state_path)
+            self.task_ledger.save()
 
             return visible
 
@@ -296,6 +305,7 @@ class Nova:
             )
             thought_raw = _strip_think_block(thought_raw)
             thought = strip_actions(thought_raw).strip()
+            thought = ToolLoopGuard.compact_visible_text(thought)
             if not thought:
                 return None
 
@@ -335,6 +345,7 @@ class Nova:
 
             self._maybe_update_self_state("（内向活动）", thought, agenda_text=prompt_hint[:200])
             self.reality_state.save(self._reality_state_path)
+            self.task_ledger.save()
             return thought
 
     # 兼容旧 API ——
@@ -350,6 +361,7 @@ class Nova:
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
+            self.task_ledger.save()
             return stats
 
     def visualize(self, output_path: str, method: str = "pca", **kwargs) -> Optional[str]:
@@ -362,6 +374,7 @@ class Nova:
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
+            self.task_ledger.save()
 
     # ==========================================================
     # Prompt / LLM / tools
@@ -369,27 +382,54 @@ class Nova:
     def _chat_with_tools(self, initial_user: str,
                          max_tokens: Optional[int] = None) -> str:
         system = self.cfg.system_prompt + "\n" + SENSORY_SYSTEM_ADDITION
+        if getattr(self.cfg, "task_state_prompt_enabled", True):
+            system += "\n" + TASK_SYSTEM_ADDITION
         if self.vm_agent is None:
             return self.llm.chat(system, initial_user, max_tokens=max_tokens)
 
         current_user = initial_user
         last_response = ""
+        guard = ToolLoopGuard(
+            max_same_action=getattr(self.cfg, "tool_guard_max_same_action", 2),
+            max_same_error=getattr(self.cfg, "tool_guard_max_same_error", 2),
+            max_repeated_response=getattr(self.cfg, "tool_guard_max_repeated_response", 2),
+        )
         for _ in range(self.cfg.max_tool_iterations):
             response = self.llm.chat(system, current_user, max_tokens=max_tokens)
+            ok, reason = guard.check_response(response)
+            if not ok:
+                if hasattr(self, "task_ledger"):
+                    self.task_ledger.set_blocked(reason)
+                return strip_actions(last_response).strip() or f"（工具循环已熔断：{reason}）"
             last_response = response
             actions = parse_actions(response)
             if not actions:
                 return response
             result_blocks = []
             reality_blocks = []
+            blocked_reason = ""
             for action_type, content in actions:
-                try:
-                    result = self.vm_agent.dispatch(action_type, content)
-                except Exception as e:
-                    result = {"error": str(e)}
+                ok, reason = guard.check_action(action_type, content)
+                if not ok:
+                    blocked_reason = reason
+                    result = {"error": reason}
+                else:
+                    try:
+                        result = self.vm_agent.dispatch(action_type, content)
+                    except Exception as e:
+                        result = {"error": str(e)}
+                guard_ok, guard_reason = guard.observe_result(action_type, result)
+                if not guard_ok:
+                    blocked_reason = guard_reason
                 trace = self.reality_state.notice_tool_result(action_type, content, result)
+                if hasattr(self, "task_ledger"):
+                    self.task_ledger.record_tool_result(action_type, content, result)
                 result_blocks.append(format_result(action_type, content, result))
                 reality_blocks.append(trace.render())
+            if blocked_reason:
+                if hasattr(self, "task_ledger"):
+                    self.task_ledger.set_blocked(blocked_reason)
+                reality_blocks.append(f"- [工具循环保护] {blocked_reason}。停止重复伸手，改为向用户说明边界或换路径。")
             current_user = (
                 current_user
                 + "\n\n[你刚才在心里这样转过：]\n"
@@ -418,6 +458,8 @@ class Nova:
         sections: list[str] = []
         sections.append(self.self_state.render_for_prompt())
         sections.append(self.reality_state.render_for_prompt())
+        if getattr(self.cfg, "task_state_prompt_enabled", True):
+            sections.append(self.task_ledger.render_for_prompt())
 
         ws_block = self._render_workspace_block().strip()
         if ws_block:
@@ -652,6 +694,7 @@ class Nova:
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
+        self.task_ledger.save()
 
     def _load_seeds(self, path: str) -> None:
         if not path or not os.path.exists(path):
