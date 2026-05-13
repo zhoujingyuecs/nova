@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="nova 本地服务（持续运行 + 连 page）")
     p.add_argument(
         "--cloud",
-        default=os.environ.get("NOVA_CLOUD_URL", "http://139.224.11.35:8080"),
+        default=os.environ.get("NOVA_CLOUD_URL", "http://127.0.0.1:8080"),
         help="云端 page.py 的 URL；也可用 NOVA_CLOUD_URL 环境变量",
     )
     p.add_argument(

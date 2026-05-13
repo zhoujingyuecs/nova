@@ -112,19 +112,34 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 
 
-def read_env() -> dict:
-    data = {}
+def _strip_quotes(v: str) -> str:
+    """剥掉值外层成对的引号。
+
+    这是关键修复点：读旧 .env 时必须先剥引号，否则下一次写回又会
+    再包一层。用 while 而不是 if，可以把以前版本 bug 累积出来的
+    ""..."" 多层引号一次性清干净。
+    """
+    v = v.strip()
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        v = v[1:-1]
+    return v
+
+
+def _parse_env_file() -> dict:
+    """读 .env 文件，返回 {key: 干净 value} 字典（引号已剥掉）。"""
+    data: dict = {}
     if ENV_FILE.is_file():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            v = v.strip()
-            if (v.startswith('"') and v.endswith('"')) or \
-               (v.startswith("'") and v.endswith("'")):
-                v = v[1:-1]
-            data[k.strip()] = v
+            data[k.strip()] = _strip_quotes(v)
+    return data
+
+
+def read_env() -> dict:
+    data = _parse_env_file()
     # 环境变量覆盖 .env
     for k in list(data):
         if k in os.environ:
@@ -136,23 +151,32 @@ def read_env() -> dict:
     return data
 
 
+def _needs_quoting(v: str) -> bool:
+    """判断值在 .env 里是否需要用双引号包起来。"""
+    if v == "":
+        return True
+    return any(c in v for c in (" ", "\t", "#", "/", ":", "="))
+
+
 def write_env(updates: dict) -> None:
     """合并写回 .env：保留旧字段、更新或新增提供的字段。"""
-    current = {}
-    if ENV_FILE.is_file():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            current[k.strip()] = v.strip()
-    current.update({k: str(v) for k, v in updates.items() if v is not None})
+    # 用统一的 _parse_env_file 读，保证引号被正确剥掉，
+    # 否则每写一次旧字段就会多包一层引号。
+    current = _parse_env_file()
+    # 进来的 updates 可能是字符串、数字、bool 等，都强转字符串；
+    # 也顺手剥一下引号，防止用户手填时多带了一层。
+    for k, v in updates.items():
+        if v is None:
+            continue
+        current[k] = _strip_quotes(str(v))
 
     body = ["# nova 本地配置（由 launcher.py 写入；可手改）",
             f"# {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
     for k, v in current.items():
-        # 用双引号包，简单粗暴
-        if " " in v or "#" in v or "/" in v or ":" in v:
+        # v 此时已经是干净的、外层不带引号的值；
+        # 不做转义——这个配置文件里的值（URL / 路径 / token）
+        # 不会含有 "，引入转义反而会和剥引号互相打架。
+        if _needs_quoting(v):
             body.append(f'{k}="{v}"')
         else:
             body.append(f"{k}={v}")
