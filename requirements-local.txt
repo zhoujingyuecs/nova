@@ -1,0 +1,15 @@
+# nova 本地大模型后端的额外依赖。
+#
+# 只有 NOVA_LLM_BACKEND=local（跑本地 GGUF）的人需要装这一份。
+# 云端 API 后端（DeepSeek / 通义 / Moonshot / ...）不需要。
+#
+# 用法：
+#     pip install -r requirements.txt          # 先装基础
+#     pip install -r requirements-local.txt    # 再装本地后端
+#
+# 注意：要 GPU 加速（CUDA / Metal）的话，llama-cpp-python 的预编译 wheel
+#       可能不带 GPU 支持。重新装的写法见 README "本地后端" 那一节。
+
+-r requirements.txt
+
+llama-cpp-python>=0.2.0

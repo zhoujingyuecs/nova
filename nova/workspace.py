@@ -45,13 +45,20 @@ import time
 from typing import Optional
 
 from .tools import VMAgent
+from .notebook import NOTEBOOK_GUIDE_MD
 
 
 WORKSPACE_BOOTSTRAP_SCRIPT = r"""set -e
 ROOT="{root}"
 mkdir -p "$ROOT/world" "$ROOT/self" "$ROOT/ops" "$ROOT/skills" "$ROOT/requests" \
-         "$ROOT/notes" "$ROOT/scripts" "$ROOT/journal"
+         "$ROOT/notes" "$ROOT/notes/archive" "$ROOT/scripts" "$ROOT/journal" "$ROOT/journal/archive"
 INDEX="$ROOT/INDEX.md"
+GUIDE="$ROOT/notes/NOTEBOOK_GUIDE.md"
+if [ ! -f "$GUIDE" ]; then
+cat > "$GUIDE" <<'NOVA_NOTEBOOK_EOF'
+{notebook_guide}
+NOVA_NOTEBOOK_EOF
+fi
 if [ ! -f "$INDEX" ]; then
 cat > "$INDEX" <<'NOVA_EOF'
 # nova 工作区
@@ -69,6 +76,7 @@ cat > "$INDEX" <<'NOVA_EOF'
 - `skills/`：别人教会我的可复用动作步骤，例如 ask_doubao.yaml。
 - `requests/`：别人交给我的未完成事项。
 - `notes/`：兼容旧目录；长期事实、操作步骤、被纠正的误解。新事实优先按上面地层分流。
+- `notes/NOTEBOOK_GUIDE.md`：我如何判断该记什么、该忘什么、旧笔记如何归档。
 - `scripts/`：我写过、用过的可重复脚本。下次直接 `python3 路径` 跑。
   顶部写一句注释说明用途。
 - `journal/`：我想留下来的日志，按日期一篇 `YYYY-MM-DD.md`。
@@ -117,7 +125,10 @@ class Workspace:
         返回是否成功。失败不致命，只是 Workspace 暂时不可用。"""
         if self._bootstrap_done or self.vm is None:
             return self._bootstrap_done
-        cmd = WORKSPACE_BOOTSTRAP_SCRIPT.format(root=self.root)
+        cmd = WORKSPACE_BOOTSTRAP_SCRIPT.format(
+            root=self.root,
+            notebook_guide=NOTEBOOK_GUIDE_MD,
+        )
         try:
             result = self.vm.shell(cmd, timeout=20)
         except Exception as e:

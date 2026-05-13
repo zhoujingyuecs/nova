@@ -1,3 +1,98 @@
+# v1.1 — 程序性记忆：从"想起" 到 "做不出来"
+
+> 想得起规则不等于改得了行为。这一版给 nova 长一条单独的习惯回路。
+
+## 起因
+
+v1.0 上线后碰到的一类反复出现的现象：你告诉 nova "发微博只能用 `~/nova_workspace/scripts/weibo/weibo_tool.py`"，她当下答应；但下一次还是开始自己写一个新的 `post_weibo.py`。问她"还记得怎么发微博吗？"她能完整说出那条规则；可"想起"和"行为下游"之间没有连线。
+
+诊断：
+
+- **联想记忆有了**——FissureField 能让她回忆起这条规则。
+- **缺一条程序性回路**——没有任何东西在她要 `<tool>shell:create_file ... post_weibo.py</tool>` 之前把这次动作拦下来。
+- **没有错误信号反馈**——你说了"我说过很多次"，这句话只是又落进 fissures，不会让那条规则的权重涨。
+
+简单说：v1.0 的 nova 有海马，没有基底节 / 多巴胺误差信号 / 习惯回路。
+
+## 加了
+
+- `nova/habits.py` —— 程序性记忆层。**与 FissureField 平级**的另一种记忆。
+  - `HabitRule`：单条规则的完整结构。`forbid` / `forbid_except` / `require` / `prefer` / `because` / `weight` / `cue_keywords` / `cue_shape`（向量）。每条规则带有 `violation_count` / `success_count` / `reinforcement_count`，越违反越重，越被强化越重。
+  - `HabitField`：规则的"场"。提供：
+    - 加载 / 保存（`habits.json`，atomic write，和 fissures 一样有 .bak 滚动备份意识）
+    - `find_active(stimulus, attention_seed)` —— 按当前 perceive 上下文挑出该亮起来的规则（关键词 + 向量相似度 + always-on 权重）
+    - `violate / succeed / reinforce / decay` —— 行为驱动的权重更新
+    - `render_active_for_prompt` —— 把活跃规则渲染成 prompt 顶部的硬约束区
+  - `HabitGate`：基底节式 Go/No-Go 门控。每次 `_chat_with_tools` 派发 `<tool>` 之前，先扫一遍活跃规则的 `forbid`，命中且没被 `forbid_except` 救回时，**这次 tool call 不会被发到 VM**——nova 收到一段 `[抑制·习惯触发]` 的合成 tool result，相当于"手伸到一半被自己缩回去"。
+
+- `<rule>` 语法 —— nova 自己可以在回答里写：
+
+  ```
+  <rule>
+  name: weibo_iron_rule
+  cue: 发微博 / 写微博 / 转发
+  forbid:
+    - scripts/weibo/post_weibo.py
+    - 自己写发微博脚本
+  forbid_except:
+    - weibo_tool.py
+  require:
+    - cat ~/nova_workspace/scripts/weibo/weibo_tool.py 先看一眼
+  because: 用户已经写好了发微博工具，重写既费时又会出错。
+  </rule>
+  ```
+
+  系统抓到这个块，会去 `HabitField.add_rule()`，然后从 visible response 里把它剥掉，不会被用户看见。
+
+- **强化信号检测** —— `detect_reinforcement_signal(text)` 识别"我说过很多次 / 又来 / 怎么又 / 别老 / 记住"等纠正语气。命中时：
+  - 找到与当前主题最匹配的 active 规则，给它的权重 + `habit_reinforce_boost`，并把 `source` 升级到 `reinforced`；
+  - 如果没有匹配到现成规则，在 prompt 顶部插一句"刚才那段话像是用户在强化某条规则——可以用 `<rule>` 写一条把它固化下来"。
+
+- **新配置项**（`NovaConfig`）：
+  - `habit_activation_threshold = 0.42`：cue_shape 余弦相似度阈值
+  - `habit_always_on_weight = 6.0`：权重 ≥ 6 的规则永远活跃
+  - `habit_max_active = 4`：每次 prompt 顶部最多渲染 4 条
+  - `habit_reinforce_boost = 1.5`：强化信号一次的权重增量
+  - `habit_block_actions = True`：HabitGate 是否真的拦截动作（False 时只观察）
+  - `habit_decay_factor_per_sleep = 0.99`：睡眠时让从未触发过的规则缓慢退场
+  - `habit_unanchored_signal_hint = True`：未匹配到规则的强化信号要不要给 prompt 提示
+  - `seed_habits_file`：启动时可载入的种子规则 JSON
+
+- **`__init__.py` 导出** —— `HabitRule / HabitField / HabitGate / detect_reinforcement_signal / extract_rule_blocks / strip_rule_blocks / SOURCE_* / STATUS_*`。
+
+- **`runtime.status()` 暴露 `habits`** —— `{count, active, archived, total_violations, total_reinforcements}`，命令行 `/status` 一眼能看。
+
+## 改了
+
+- **`config.py` system_prompt** —— 多了一段告诉 nova：你有两套记忆，一套是被使用本身改写的地形（fissures），一套是被违反 / 强化反复重塑的硬约束（habits）。明确教她 `<rule>` 的写法和 forbid/allow_if/require/prefer/because 各字段的语义，以及"行为级硬约束才用 rule，软偏好继续走 notes/"。
+- **`mind.py`**：
+  - `__init__`：实例化 `HabitField` 并尝试 `seed_habits_file` 加载。
+  - `perceive` / `think`：进入主路径前先 `_maybe_reinforce_from_signal`（处理强化信号），然后 `_select_active_habits`，把活跃规则带进 `_build_prompt` 和 `_chat_with_tools`；末尾 `_extract_and_save_rules` 抓 `<rule>` 块入库，并用 `strip_rule_blocks` 把它们从 visible response 里剥掉。
+  - `_chat_with_tools`：在每次 VM 派发前调用 `HabitGate.evaluate`。命中：跳过派发，回送一段 "[抑制·习惯触发]" 合成 tool result，自动 `habit_field.violate()`；未命中且执行成功并匹配到 `prefer/require` 子串时，自动 `habit_field.succeed()`。
+  - `_build_prompt`：习惯块渲染在 prompt **最顶部**，先于 SelfState；如果有未锚定的强化信号或新强化的规则，加一段提示。
+  - `consolidate / save / _tick_autosave`：都额外保存 `habit_field`；睡眠时调用 `habit_field.decay()`。
+- **`runtime.py`**：`status()` 多了 `habits` 段；`status_text()` 多了一行 `习惯：active=X violations=Y reinforced=Z`。
+
+## 落盘
+
+- 新增：`{field_path}/habits.json`（atomic write）。
+- 不动：`fissures.json` / `agenda.json` / `worklog.jsonl` / `self_state.json` / 工作区。
+
+## 与 v1.0 的兼容性
+
+- **数据兼容**：旧的 fissures / agenda / worklog / self_state 全部直接读。第一次启动 v1.1 时 `habits.json` 不存在，自动从空集开始，可在 `seed_habits_file` 里给一份初始种子。
+- **API 兼容**：`Nova.perceive / think / consolidate / save` 签名不变。新增了 `nova.habit_field` 属性。
+- 用户最关心的"还能像之前那样用 `local.py --commission`"——能。
+
+## 设计上的取舍
+
+- **不再走 LLM 抽规则的路径**。规则要么由用户/nova 显式写 `<rule>`，要么由强化信号触发提示让 nova 写。理由：规则要稳定、可读、可调；让 LLM 默默生成会带来无法追溯的"我什么时候多了这条"的问题。
+- **`forbid` 用的是不区分大小写的子串匹配**，不是正则。对 nova 写的 `<rule>` 来说，子串足够直观；正则会让她写错而不自知。
+- **`forbid_except`** 的存在很关键——`forbid: scripts/weibo/` 时，`forbid_except: weibo_tool.py` 让她仍然能正常调用那个许可工具，否则规则会把"做对的事"也拦下。
+- **HabitGate 命中是合成 tool result，不是异常**。这样 nova 在自己上下文里看到的是一段"抑制反馈"，可以基于它选下一步——和真实大脑的基底节一样，不是把动作崩成错误，而是不让它发生。
+
+---
+
 # v1.0 — 精简内核：从九个子系统压成两层
 
 > 大模型应当是处理器；事实和脚本应当住在外部文件里；脑子里只放形状和当下意识。

@@ -219,6 +219,12 @@ class ContinuousRuntime(threading.Thread):
         task_ledger = getattr(self.nova, "task_ledger", None)
         if task_ledger is not None:
             data["task_state"] = task_ledger.to_dict()
+        habit_field = getattr(self.nova, "habit_field", None)
+        if habit_field is not None:
+            try:
+                data["habits"] = habit_field.stats()
+            except Exception:
+                pass
         return data
 
     def status_text(self) -> str:
@@ -254,6 +260,14 @@ class ContinuousRuntime(threading.Thread):
         parts.append("")
         parts.append("最近工作：")
         parts.append(self.worklog.summary_text(limit=8))
+        habits = state.get("habits") or {}
+        if habits:
+            parts.append("")
+            parts.append(
+                f"习惯：active={habits.get('active', 0)} "
+                f"violations={habits.get('total_violations', 0)} "
+                f"reinforced={habits.get('total_reinforcements', 0)}"
+            )
         return "\n".join(parts)
 
     def recent_work_text(self, *, limit: int = 12) -> str:

@@ -213,6 +213,15 @@ POST
 python3 ~/nova_workspace/scripts/weibo/weibo_tool.py post --text-file /tmp/weibo_post.txt --json
 ```
 
+带图发微博（最多 9 张，路径用空格分隔；支持 jpg/jpeg/png/gif/webp/bmp）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py post \
+  --text-file /tmp/weibo_post.txt \
+  --images /path/to/a.jpg /path/to/b.png \
+  --json
+```
+
 发布成功后，工具会尽量从自己的近期微博验证。如果返回 `VERIFY_FAILED`，不要假装成功。
 
 ### 评论
@@ -224,6 +233,16 @@ COMMENT
 python3 ~/nova_workspace/scripts/weibo/weibo_tool.py comment \
   --post-url "https://weibo.com/UID/BID" \
   --text-file /tmp/weibo_comment.txt \
+  --json
+```
+
+带图评论（桌面网页版评论一次只能 1 张图）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py comment \
+  --post-url "https://weibo.com/UID/BID" \
+  --text-file /tmp/weibo_comment.txt \
+  --images /path/to/reaction.jpg \
   --json
 ```
 
@@ -242,6 +261,18 @@ python3 ~/nova_workspace/scripts/weibo/weibo_tool.py reply-comment \
   --comment-id "评论ID或占位ID" \
   --comment-text "对方评论中的一段文字" \
   --text-file /tmp/weibo_reply.txt \
+  --json
+```
+
+带图回复（同样 1 张上限）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py reply-comment \
+  --post-url "https://weibo.com/UID/BID" \
+  --comment-id "评论ID或占位ID" \
+  --comment-text "对方评论中的一段文字" \
+  --text-file /tmp/weibo_reply.txt \
+  --images /path/to/reply.png \
   --json
 ```
 
@@ -273,6 +304,23 @@ python3 ~/nova_workspace/scripts/weibo/weibo_tool.py unlike --post-url "https://
 ```bash
 python3 ~/nova_workspace/scripts/weibo/weibo_tool.py delete-post --post-url "https://weibo.com/UID/BID" --json
 ```
+
+### 图片上传规则
+
+`post` / `comment` / `reply-comment` 三个命令都接 `--images`，后面跟一个或多个本地图片路径，空格分隔：
+
+```bash
+--images /path/to/a.jpg /path/to/b.png
+```
+
+nova 需要记住：
+
+- `post` 最多 **9 张**；`comment` 和 `reply-comment` 最多 **1 张**（桌面网页版评论本身只允许 1 张）。超出会得到 `error_code=IMAGE_INVALID`，不要重试。
+- 支持的扩展名只有 `.jpg .jpeg .png .gif .webp .bmp`。其它扩展名会被 `IMAGE_INVALID` 拒绝。
+- 单张图片超 20 MB 直接拒绝；超 5 MB 只是 warning。
+- 图片路径必须 nova 自己能在文件系统上 `ls` 到。如果用户给了一个链接但没有下到本地，nova 不要自己上网下载，应该把这件事告诉用户。
+- 在工具返回的 JSON 里多了一个 `images` 字段。`images.count` 是实际附加的张数，`images.thumbnails_detected` 是工具在撰写器附近观察到的缩略图数。如果二者不匹配，会有 warning，nova 应一并转告用户。
+- 如果 `error_code=IMAGE_UPLOAD_FAILED`，意思是图片上传没成功（要么没拿到文件选择对话框，要么没有任何缩略图出现）。这种情况微博端通常什么都没发。把 `debug_artifacts` 路径告诉用户，让人去看是否被风控或图片本身有问题。
 
 ---
 
@@ -327,9 +375,9 @@ debug 文件会在：
 - `post-detail`：看一条微博和评论。
 - `notifications`：看通知。
 - `stats`：看自己微博数据。
-- `post`：发微博。
-- `comment`：评论。
-- `reply-comment`：回复评论。
+- `post`：发微博，可带 `--images`（最多 9 张）。
+- `comment`：评论，可带 `--images`（最多 1 张）。
+- `reply-comment`：回复评论，可带 `--images`（最多 1 张）。
 - `repost`：转发。
 - `like/unlike`：点赞/取消。
 

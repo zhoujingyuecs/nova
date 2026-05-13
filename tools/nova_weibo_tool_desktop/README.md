@@ -149,6 +149,15 @@ EOF2
 python3 ~/nova_workspace/scripts/weibo/weibo_tool.py post --text-file /tmp/weibo_post.txt --json
 ```
 
+带图发微博（最多 9 张，路径用空格分隔）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py post \
+  --text-file /tmp/weibo_post.txt \
+  --images ~/Pictures/a.jpg ~/Pictures/b.png \
+  --json
+```
+
 ### 评论
 
 ```bash
@@ -158,6 +167,16 @@ EOF2
 python3 ~/nova_workspace/scripts/weibo/weibo_tool.py comment \
   --post-url "https://weibo.com/用户UID/微博BID" \
   --text-file /tmp/weibo_comment.txt \
+  --json
+```
+
+带图评论（桌面网页版评论一次只能 1 张图）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py comment \
+  --post-url "https://weibo.com/用户UID/微博BID" \
+  --text-file /tmp/weibo_comment.txt \
+  --images ~/Pictures/reaction.jpg \
   --json
 ```
 
@@ -177,6 +196,18 @@ python3 ~/nova_workspace/scripts/weibo/weibo_tool.py reply-comment \
   --json
 ```
 
+带图回复（同样 1 张上限，加 `--images`）：
+
+```bash
+python3 ~/nova_workspace/scripts/weibo/weibo_tool.py reply-comment \
+  --post-url "https://weibo.com/用户UID/微博BID" \
+  --comment-id "评论ID或占位ID" \
+  --comment-text "对方评论中的一段文字" \
+  --text-file /tmp/weibo_reply.txt \
+  --images ~/Pictures/reply.png \
+  --json
+```
+
 ### 查看浏览量/互动数据
 
 ```bash
@@ -190,6 +221,59 @@ python3 ~/nova_workspace/scripts/weibo/weibo_tool.py stats --post-url "https://w
 ```
 
 如果桌面页面没有显示浏览量，工具会返回 `views: null`，nova 不能猜。
+
+---
+
+## 图片上传
+
+`post` / `comment` / `reply-comment` 都支持 `--images`，后面跟一个或多个本地图片路径：
+
+```bash
+--images ~/Pictures/a.jpg ~/Pictures/b.png /abs/path/c.gif
+```
+
+规则：
+
+- `post` 最多 9 张；`comment` 和 `reply-comment` 最多 1 张（桌面网页版评论本身只允许 1 张）。
+- 支持的扩展名：`.jpg` `.jpeg` `.png` `.gif` `.webp` `.bmp`。
+- 单张超过 20 MB 直接拒绝（避免漫长等待后被微博拒）；超过 5 MB 只是 warning。
+- 路径可以带 `~`，相对路径相对于工具运行时的工作目录。
+- 同一路径在一次调用里重复出现会被去重。
+- 文本和图片可以一起发；纯图（空文本）也可以，但建议至少一两个字，微博偶尔会卡空文本。
+
+工具返回 JSON 多了一个 `images` 字段（没传图时是 `null`）：
+
+```json
+{
+  "ok": true,
+  "action": "post",
+  "status": "published",
+  "data": {
+    "post": {"text": "..."},
+    "images": {
+      "count": 2,
+      "method": "input",
+      "thumbnails_detected": 2,
+      "paths": ["/home/user/Pictures/a.jpg", "/home/user/Pictures/b.png"]
+    },
+    "verified": true,
+    "verification": "ui_signal+fetch"
+  },
+  "warnings": []
+}
+```
+
+字段含义：
+
+- `count`：实际附加的图片数量（去重后）。
+- `method`：`input` 表示工具直接对页面里的 `<input type=file>` 做 `set_input_files()`；`file_chooser` 表示工具点了"图片"按钮后用文件选择对话框处理。
+- `thumbnails_detected`：工具在撰写器附近观察到的缩略图数量，作为"图片确实被微博接受"的补强信号。
+- `paths`：解析后的绝对路径列表，可用来追溯。
+
+失败模式：
+
+- `error_code=IMAGE_INVALID`：路径不存在、不是文件、扩展名不支持、单张过大、张数超限。这种错误**发生在打开浏览器之前**（路径校验在主进程里完成），所以代价小。
+- `error_code=IMAGE_UPLOAD_FAILED`：图片交给页面了但 10 秒内没拿到文件选择对话框，或没观察到任何缩略图（疑似被微博静默拒绝）。debug 文件会落地到 `~/nova_workspace/state/weibo/debug/`。
 
 ---
 
@@ -215,4 +299,4 @@ python3 ~/nova_workspace/scripts/weibo/weibo_tool.py stats --post-url "https://w
 
 工具不会绕过验证码、不会绕过账号风控、不会刷量、不会伪装成人类规避平台限制。出现登录、验证码、短信、安全检查时，工具返回 `blocked`，需要你手动处理。
 
-当前第一版优先支持纯文本发微博、评论、回复、转发、点赞、读取和统计。图片上传还没实现。
+当前已支持发微博、评论、回复评论、转发、点赞、读取和统计；发微博、评论、回复评论时可以**附加图片**（见下一节）。

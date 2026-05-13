@@ -1,10 +1,21 @@
-llama-cpp-python>=0.2.0
+# nova 基础依赖（云端 / 本地后端都需要的）
+#
+# 想跑本地 GGUF（llama_cpp）？另外装一遍：
+#     pip install -r requirements-local.txt
+#
+# 完全 cloud-only 部署连显卡都不要，这一份装完就够。
+
+# 嵌入器（中文 BGE-small，100MB 左右，CPU 跑足够）
 sentence-transformers>=2.5.0
 numpy>=1.24.0
 
 # local.py 连云端 page 用的 socketio 客户端
 python-socketio[client]>=5.0.0
 
+# page.py / vm_agent.py 跑网页 / HTTP 服务
+Flask>=2.0.0
+Flask-SocketIO>=5.0.0
+
 # 可视化（陶土球的 2D 投影），可选
 matplotlib>=3.7.0
-scikit-learn>=1.3.0   # 通常已经被 sentence-transformers 拉进来
+scikit-learn>=1.3.0

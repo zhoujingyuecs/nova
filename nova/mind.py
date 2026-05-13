@@ -1,25 +1,38 @@
-"""nova v1.0 主循环 —— 精简内核版。
+"""nova v1.1 主循环 —— 加上程序性记忆门控。
 
-老版本里 perceive 一次会做四次 LLM 调用：主回应、意象拆解、主意识更新、
-笔记本更新。每次还要把 SelfField / DriveSystem / SkillBook /
-SelfModificationLog / NotesBook 五个块都渲染进 prompt，加起来 prompt
-头部经常占掉两千字符还没说一句正经话。
+v1.0 的回路只完成了"想起"那一半：
+   感官输入 → 嵌入 → 水流唤起相关裂缝 → 拼 prompt → LLM → 工具 → 反向刻入
 
-v1.0 把它压成一次主回应 + 偶尔一次轻量级 self_state 更新。
+v1.1 在两个位置塞进了"动作管制"那一半：
 
-每轮 perceive 做的事：
+  (A) prompt 顶部。Nova 的程序性记忆里如果有规则的 cue 命中当前场景，
+      它会被搬到 prompt 最前面，作为"硬约束"——不再混在普通回忆里。
+      规则被违反过越多次、被用户强化过越多次，就越显眼。
+
+  (B) tool 派发前。LLM 的回应里出现 <tool> 块时，HabitGate 先扫一遍
+      当前激活规则的 forbid 列表。命中了就**不真的派发动作**，而是
+      把"你刚才差点违反规则 X"作为 tool result 回灌给 LLM，让它在
+      下一轮重新选路径。这一步对应基底节的 Go / No-Go。
+
+每轮 perceive 做的事（v1.1）：
+  0. 用户输入里如果有"我说了很多次"之类的反复纠正信号，先去找最匹配
+     的旧规则加权（多巴胺式负反馈）；找不到就在 prompt 里塞一段提示，
+     建议 nova 把这条新规则写成 <rule> 块固化下来。
   1. 嵌入 stimulus
-  2. 让水流从 (stimulus + self_state) 这个混合种子出发，沿语义近邻、
-     暗道、对话链、冷跳收集激活缝隙
-  3. 拼 prompt：SelfState + 工作区索引 + 激活缝隙 + 当前对话链 + 输入
-  4. 调一次 LLM；如果回应里有 <tool> 块，让 VM 的手做完，把 result
-     填回 prompt，再调一次；最多 max_tool_iterations 次
-  5. 把回应嵌入，反向冲刷激活的缝隙；新增 stimulus / response 两条
-     缝隙到对话链
-  6. 每 cfg.self_update_every 次 perceive，触发一次轻量 self_state 更新
-  7. 自动存盘
+  2. 让水流从 (stimulus + self_state) 出发收集激活缝隙
+  3. **算出当前生效的硬约束（active habits）**
+  4. 拼 prompt：[硬约束] + SelfState + 工作区索引 + 激活缝隙 + 当前对话链 + 输入
+  5. 调一次 LLM；回应里有 <tool>：
+       a. **HabitGate.evaluate**：命中 forbid 就把抑制消息塞回去，不派发；
+          rule.violation_count += 1，rule.weight 上升；
+       b. 否则照旧派发到 VM；
+     最多 max_tool_iterations 次
+  6. 把回应嵌入，反向冲刷激活缝隙；新增 stimulus / response 缝隙到对话链
+  7. **解析回应里的 <rule> 块**：把 nova 自己识别出的硬约束写进 HabitField
+  8. 每 cfg.self_update_every 次 perceive，触发一次轻量 self_state 更新
+  9. 自动存盘
 
-dream / think 是同样的流程，只是种子来自缝隙场内部 + self_state。
+dream / think 走相同路径；走神/主线推进时也享受规则保护。
 """
 from __future__ import annotations
 
@@ -45,6 +58,16 @@ from .fissure import (
     SPEAKER_NONE,
 )
 from .flow import ConsciousnessFlow
+from .habits import (
+    HabitField,
+    HabitGate,
+    HabitRule,
+    SOURCE_REINFORCED,
+    SOURCE_SELF as HABIT_SOURCE_SELF,
+    detect_reinforcement_signal,
+    extract_rule_blocks,
+    strip_rule_blocks,
+)
 from .llm import LocalLLM
 from .persistence import load_field, save_field
 from .perception import (
@@ -63,10 +86,12 @@ from .tools import VMAgent, format_result, parse_actions, strip_actions
 from .task_state import TaskLedger, TASK_SYSTEM_ADDITION
 from .tool_guard import ToolLoopGuard
 from .workspace import Workspace
+from .notebook import NOTEBOOK_HABIT_BLOCK
 
 
 DREAM_PROMPT_BASE = (
     "[此刻你独自一人，没有谁在和你说话。你的思绪自己飘起来。]\n\n"
+    "{habit_block}"
     "{state_block}"
     "{workspace_block}"
     "[下面这些片段浮上心头——是素材，不是替代品：]\n\n"
@@ -131,6 +156,17 @@ class Nova:
         self._task_state_path = os.path.join(self.cfg.field_path, "task_state.json")
         self.task_ledger = TaskLedger.load(self._task_state_path)
 
+        # v1.1: 程序性记忆（HabitField）
+        self._habit_state_path = os.path.join(self.cfg.field_path, "habits.json")
+        self.habit_field = HabitField.load(self.cfg, self.embedder, self._habit_state_path)
+        if len(self.habit_field):
+            stats = self.habit_field.stats()
+            print(
+                f"📜 程序性记忆加载：{stats['active']} 条 active 规则，"
+                f"累计违反 {stats['total_violations']} 次，"
+                f"用户强化 {stats['total_reinforcements']} 次。"
+            )
+
         # VM hand + workspace
         self.vm_agent: Optional[VMAgent] = None
         if self.cfg.vm_agent_url:
@@ -161,6 +197,8 @@ class Nova:
         self._last_episode_activity: float = 0.0
         self._last_episode_fid: str = ""
         self._current_turn_index: int = 0
+        # 最近若干轮工具动作（给 habit 激活时当上下文匹配用）
+        self._recent_actions_log: collections.deque = collections.deque(maxlen=12)
 
         self._restore_episode_state_from_field()
 
@@ -177,8 +215,7 @@ class Nova:
         with self._lock:
             episode_id = self._get_or_start_episode()
 
-            # 外部输入先变成“听见的东西”，再进入裂缝场。
-            # 这样 nova 记得：这是对方说的，不是自己想到的。
+            # 外部输入先变成"听见的东西"，再进入裂缝场。
             stim_percept = self.reality_state.hear_user(stimulus, speaker="周靖越")
             self.task_ledger.observe_user_message(stimulus)
 
@@ -195,7 +232,10 @@ class Nova:
                 unresolved=bool(self.reality_state.current_request and self.reality_state.current_request.status == "active"),
             )
 
-            # 水流：种子 = stimulus + self_state 形状
+            # 0. 反复纠正信号检测：先一击命中，多巴胺式负反馈
+            reinforced_rule, signal_hit = self._maybe_reinforce_from_signal(stimulus)
+
+            # 1. 水流：种子 = stimulus + self_state 形状
             attention_seed = self._compose_attention_seed(stim_shape)
             episode_anchors = self.field.walk_chain_back(stim_fid, k=self.cfg.episode_recall_size)
             activated = self.flow_engine.flow(
@@ -204,10 +244,24 @@ class Nova:
                 mandatory_anchors=episode_anchors,
             )
 
-            user_prompt = self._build_prompt(stimulus, stim_fid, activated, episode_id)
-            final_response = self._chat_with_tools(user_prompt)
+            # 2. 激活程序性记忆（硬约束）
+            active_habits = self._select_active_habits(stimulus, attention_seed)
+
+            # 3. 拼 prompt
+            user_prompt = self._build_prompt(
+                stimulus, stim_fid, activated, episode_id,
+                active_habits=active_habits,
+                signal_hit_unanchored=(signal_hit and reinforced_rule is None),
+                reinforced_rule=reinforced_rule,
+            )
+
+            # 4. 调 LLM；工具循环里走 HabitGate
+            final_response = self._chat_with_tools(user_prompt, active_habits=active_habits)
             final_response = _strip_think_block(final_response)
-            visible = strip_actions(final_response).strip() or "（沉默。）"
+
+            # 5. 拿掉 <rule> 块（既保存又不让外部看到）
+            new_rules = self._extract_and_save_rules(final_response, source=HABIT_SOURCE_SELF)
+            visible = strip_rule_blocks(strip_actions(final_response)).strip() or "（沉默。）"
             visible = ToolLoopGuard.compact_visible_text(visible)
 
             response_percept = self.reality_state.notice_self_response(visible)
@@ -259,6 +313,8 @@ class Nova:
             self._maybe_update_self_state(stimulus, visible, agenda_text="")
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
+            # 程序性记忆每轮都落盘（很轻）
+            self.habit_field.save()
 
             return visible
 
@@ -281,6 +337,9 @@ class Nova:
             if not activated:
                 return None
 
+            # 内向活动也享受规则保护：种子 + prompt_hint 组成上下文
+            active_habits = self._select_active_habits(prompt_hint, attention_seed)
+
             memories = "\n".join(
                 f"- {self._format_recall_line(f, in_episode=False)}"
                 for f in activated
@@ -289,7 +348,10 @@ class Nova:
                 max_chars=self.cfg.self_update_max_tokens * 4,
             ) + "\n\n"
             workspace_block = self._render_workspace_block()
+            workspace_block = NOTEBOOK_HABIT_BLOCK.strip() + "\n\n" + workspace_block
+            habit_block = self._render_habit_block(active_habits)
             base_prompt = DREAM_PROMPT_BASE.format(
+                habit_block=habit_block,
                 memories=memories,
                 state_block=state_block,
                 workspace_block=workspace_block,
@@ -302,9 +364,11 @@ class Nova:
             thought_raw = self._chat_with_tools(
                 user_prompt,
                 max_tokens=max_tokens or self.cfg.daydream_max_tokens,
+                active_habits=active_habits,
             )
             thought_raw = _strip_think_block(thought_raw)
-            thought = strip_actions(thought_raw).strip()
+            self._extract_and_save_rules(thought_raw, source=HABIT_SOURCE_SELF)
+            thought = strip_rule_blocks(strip_actions(thought_raw)).strip()
             thought = ToolLoopGuard.compact_visible_text(thought)
             if not thought:
                 return None
@@ -346,6 +410,7 @@ class Nova:
             self._maybe_update_self_state("（内向活动）", thought, agenda_text=prompt_hint[:200])
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
+            self.habit_field.save()
             return thought
 
     # 兼容旧 API ——
@@ -358,6 +423,10 @@ class Nova:
         with self._lock:
             stats = _consolidate(self.field, self.cfg, prune=prune,
                                  merge=merge, decay_links=decay_links)
+            # 程序性记忆也跟着衰减
+            decayed = self.habit_field.decay(self.cfg.habit_decay_factor_per_sleep)
+            stats["habits_decayed"] = decayed
+            self.habit_field.save()
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
@@ -375,12 +444,15 @@ class Nova:
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
+            self.habit_field.save()
 
     # ==========================================================
     # Prompt / LLM / tools
     # ==========================================================
     def _chat_with_tools(self, initial_user: str,
-                         max_tokens: Optional[int] = None) -> str:
+                         max_tokens: Optional[int] = None,
+                         active_habits: Optional[list[HabitRule]] = None) -> str:
+        active_habits = active_habits or []
         system = self.cfg.system_prompt + "\n" + SENSORY_SYSTEM_ADDITION
         if getattr(self.cfg, "task_state_prompt_enabled", True):
             system += "\n" + TASK_SYSTEM_ADDITION
@@ -409,6 +481,36 @@ class Nova:
             reality_blocks = []
             blocked_reason = ""
             for action_type, content in actions:
+                # —— 程序性记忆门控（基底节式 Go / No-Go）——
+                gate_hit = HabitGate.evaluate(action_type, content, active_habits)
+                if gate_hit and getattr(self.cfg, "habit_block_actions", True):
+                    rule, matched_pat = gate_hit
+                    self.habit_field.violate(
+                        rule.id,
+                        action_content=content,
+                        matched_pattern=matched_pat,
+                    )
+                    block_msg = HabitGate.render_block_message(
+                        rule, matched_pat, action_type, content,
+                    )
+                    # 让它走和 error 同形的回路：tool result 里包一段抑制说明
+                    result = {
+                        "error": block_msg,
+                        "habit_violation": True,
+                        "rule_id": rule.id,
+                    }
+                    # 工具守卫也要看到这次"失败"以触发熔断保护
+                    guard.observe_result(action_type, result)
+                    trace = self.reality_state.notice_tool_result(action_type, content, result)
+                    if hasattr(self, "task_ledger"):
+                        self.task_ledger.record_tool_result(action_type, content, result)
+                    result_blocks.append(format_result(action_type, content, result))
+                    reality_blocks.append(trace.render())
+                    blocked_reason = f"违反规则「{rule.name}」"
+                    self._recent_actions_log.append(f"[gated] {action_type}: {content[:80]}")
+                    continue
+
+                # —— 普通工具守卫（重复动作熔断）——
                 ok, reason = guard.check_action(action_type, content)
                 if not ok:
                     blocked_reason = reason
@@ -426,6 +528,23 @@ class Nova:
                     self.task_ledger.record_tool_result(action_type, content, result)
                 result_blocks.append(format_result(action_type, content, result))
                 reality_blocks.append(trace.render())
+                # 记录最近动作给 habit 上下文用
+                self._recent_actions_log.append(f"{action_type}: {content[:80]}")
+
+                # 如果这个动作没有违反任何规则，且执行成功——
+                # 给当前激活规则记一笔成功（"我遵守了你"）。
+                if not result.get("error") and not gate_hit:
+                    for rule in active_habits:
+                        # 但只给"匹配 cue"或"全局铁律"那部分计成功
+                        # 这里用一个简单 heuristic：动作里出现 prefer/require 子串就算
+                        recognized = False
+                        for x in rule.prefer + rule.require:
+                            if x and x[:24].lower() in content.lower():
+                                recognized = True
+                                break
+                        if recognized:
+                            self.habit_field.succeed(rule.id)
+
             if blocked_reason:
                 if hasattr(self, "task_ledger"):
                     self.task_ledger.set_blocked(blocked_reason)
@@ -438,13 +557,20 @@ class Nova:
                 + "\n\n".join(result_blocks)
                 + "\n\n[现实感校准：这次伸手到底摸到了什么]\n"
                 + "\n".join(reality_blocks)
-                + "\n\n[继续。可以再伸手，也可以直接对眼前的人说话。若事实还没有证据，就说还没查到，不要补全。]"
+                + "\n\n[继续。可以再伸手，也可以直接对眼前的人说话。"
+                  "若刚才有动作被『抑制·习惯触发』拦下，请按规则的 prefer / require 改路径，"
+                  "不要再生成同类被禁止的动作。"
+                  "若事实还没有证据，就说还没查到，不要补全。]"
             )
         print(f"⚠️ 工具调用超过 {self.cfg.max_tool_iterations} 次，停下了。")
         return last_response
 
     def _build_prompt(self, stimulus: str, stim_fid: str,
-                      activated: list, episode_id: str) -> str:
+                      activated: list, episode_id: str,
+                      *,
+                      active_habits: Optional[list[HabitRule]] = None,
+                      signal_hit_unanchored: bool = False,
+                      reinforced_rule: Optional[HabitRule] = None) -> str:
         in_episode: list[Fissure] = []
         others: list[Fissure] = []
         for f in activated:
@@ -456,7 +582,26 @@ class Nova:
                 others.append(f)
 
         sections: list[str] = []
+
+        # 硬约束放最前面，比 SelfState 更上头
+        habit_text = self._render_habit_block(active_habits or [], trailing_blank=False)
+        if habit_text:
+            sections.append(habit_text)
+
+        if signal_hit_unanchored and getattr(self.cfg, "habit_unanchored_signal_hint", True):
+            sections.append(self.habit_field.render_unanchored_signal_hint())
+        elif reinforced_rule is not None:
+            sections.append(
+                "[反复纠正已生效]\n"
+                f"对方刚才用反复纠正语气提到了你已有的规则「{reinforced_rule.name}」，"
+                f"系统已自动增加它的权重（已被强化 {reinforced_rule.reinforcement_count} 次，"
+                f"被违反过 {reinforced_rule.violation_count} 次）。"
+                f"这是它存在的根据：{reinforced_rule.rationale or '（你自己写下的硬约束）'}。\n"
+                "请把它当作下一步动作的边界来选路径，而不是当作普通笔记。"
+            )
+
         sections.append(self.self_state.render_for_prompt())
+        sections.append(NOTEBOOK_HABIT_BLOCK)
         sections.append(self.reality_state.render_for_prompt())
         if getattr(self.cfg, "task_state_prompt_enabled", True):
             sections.append(self.task_ledger.render_for_prompt())
@@ -496,40 +641,92 @@ class Nova:
         text = self.workspace.render_for_prompt()
         return text + "\n\n" if text else ""
 
-    # ==========================================================
-    # SelfState 更新（每 N 次 perceive 触发一次轻量 LLM 调用）
-    # ==========================================================
-    def _maybe_update_self_state(self, stimulus: str, response: str,
-                                 agenda_text: str) -> None:
-        every = max(1, self.cfg.self_update_every)
-        if (self._perceive_count % every) != 0:
-            return
-        event = f"输入：{stimulus[:400]}\n回应：{response[:400]}"
-        prompt = SELF_UPDATE_PROMPT.format(
-            current_state=self.self_state.render_for_prompt(max_chars=800),
-            event=event,
-            agenda_text=agenda_text or "（无）",
+    def _render_habit_block(self, active: list[HabitRule],
+                            trailing_blank: bool = True) -> str:
+        if not active:
+            return ""
+        text = self.habit_field.render_active_for_prompt(
+            active,
+            max_chars=2200,
+            max_rules=getattr(self.cfg, "habit_max_active", 4),
         )
+        if not text:
+            return ""
+        return text + "\n\n" if trailing_blank else text
+
+    # ==========================================================
+    # 程序性记忆相关辅助
+    # ==========================================================
+    def _select_active_habits(self, stimulus_text: str,
+                              attention_seed: np.ndarray) -> list[HabitRule]:
+        if len(self.habit_field) == 0:
+            return []
+        recent_action_blob = " | ".join(self._recent_actions_log) if self._recent_actions_log else ""
         try:
-            raw = self.llm.chat(
-                "你是 nova 的 SelfState 维护器，只输出 FOCUS / SUMMARY / OPEN / CLOSE 控制行。",
-                prompt,
-                max_tokens=self.cfg.self_update_max_tokens,
-            )
-        except Exception as e:
-            print(f"⚠️ self_state 更新失败（不致命）：{e}")
-            return
-        raw = _strip_think_block(raw)
-        if "（无变动" in raw or "(无变动" in raw:
-            return
-        kwargs = parse_self_update(raw)
-        if not kwargs:
-            return
-        if self.self_state.apply_update(**kwargs):
-            try:
-                self.self_state.save(self._self_state_path)
-            except Exception:
-                pass
+            self_state_text = " ".join([
+                self.self_state.current_focus or "",
+                self.self_state.recent_summary or "",
+                " ".join(self.self_state.open_threads or []),
+            ])
+        except Exception:
+            self_state_text = ""
+        return self.habit_field.find_active(
+            stimulus_text=stimulus_text or "",
+            attention_seed=attention_seed,
+            self_state_text=self_state_text,
+            recent_action_blob=recent_action_blob,
+            max_active=getattr(self.cfg, "habit_max_active", 4),
+        )
+
+    def _maybe_reinforce_from_signal(self, stimulus: str
+                                     ) -> tuple[Optional[HabitRule], bool]:
+        """如果 stimulus 里有反复纠正信号：
+
+        - 找匹配规则 → 加权（多巴胺式负反馈）
+        - 找不到 → 让上层在 prompt 里塞一段"建议写 <rule>"的提示
+
+        返回 (被加强的规则 or None, 是否检测到信号)。
+        """
+        if not detect_reinforcement_signal(stimulus):
+            return None, False
+        recent_text = ""
+        try:
+            recent_text = " ".join([
+                self.self_state.recent_summary or "",
+                " ".join(self.self_state.open_threads or []),
+            ])
+        except Exception:
+            pass
+        attn_seed = None
+        try:
+            attn_seed = self.embedder.embed(stimulus + " " + recent_text)
+        except Exception:
+            pass
+        match = self.habit_field.find_match_for_signal(
+            stimulus,
+            recent_text=recent_text,
+            attention_seed=attn_seed,
+        )
+        if match is None:
+            return None, True
+        boost = float(getattr(self.cfg, "habit_reinforce_boost", 1.5))
+        self.habit_field.reinforce(match.id, boost=boost, kind="user_signal")
+        if match.source != HABIT_SOURCE_SELF:
+            match.source = SOURCE_REINFORCED
+        return match, True
+
+    def _extract_and_save_rules(self, response_text: str,
+                                source: str = HABIT_SOURCE_SELF) -> list[HabitRule]:
+        if not response_text:
+            return []
+        parsed = extract_rule_blocks(response_text)
+        out: list[HabitRule] = []
+        for d in parsed:
+            rule = self.habit_field.add_rule(d, source=source)
+            if rule is not None:
+                print(f"📜 新规则已写入程序性记忆：{rule.name} (id={rule.id}, weight={rule.weight:.2f})")
+                out.append(rule)
+        return out
 
     # ==========================================================
     # Episode / 对话链
@@ -694,6 +891,7 @@ class Nova:
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
+            self.habit_field.save()
         self.task_ledger.save()
 
     def _load_seeds(self, path: str) -> None:
@@ -792,3 +990,38 @@ class Nova:
         if rel == 3:
             return "上上句"
         return f"{rel - 1} 句之前"
+
+    # ==========================================================
+    # SelfState 更新（每 N 次 perceive 触发一次轻量 LLM 调用）
+    # ==========================================================
+    def _maybe_update_self_state(self, stimulus: str, response: str,
+                                 agenda_text: str) -> None:
+        every = max(1, self.cfg.self_update_every)
+        if (self._perceive_count % every) != 0:
+            return
+        event = f"输入：{stimulus[:400]}\n回应：{response[:400]}"
+        prompt = SELF_UPDATE_PROMPT.format(
+            current_state=self.self_state.render_for_prompt(max_chars=800),
+            event=event,
+            agenda_text=agenda_text or "（无）",
+        )
+        try:
+            raw = self.llm.chat(
+                "你是 nova 的 SelfState 维护器，只输出 FOCUS / SUMMARY / OPEN / CLOSE 控制行。",
+                prompt,
+                max_tokens=self.cfg.self_update_max_tokens,
+            )
+        except Exception as e:
+            print(f"⚠️ self_state 更新失败（不致命）：{e}")
+            return
+        raw = _strip_think_block(raw)
+        if "（无变动" in raw or "(无变动" in raw:
+            return
+        kwargs = parse_self_update(raw)
+        if not kwargs:
+            return
+        if self.self_state.apply_update(**kwargs):
+            try:
+                self.self_state.save(self._self_state_path)
+            except Exception:
+                pass

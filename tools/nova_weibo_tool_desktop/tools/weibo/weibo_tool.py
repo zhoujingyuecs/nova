@@ -65,7 +65,16 @@ ERROR_POLICY_DENIED = "POLICY_DENIED"
 ERROR_NETWORK = "NETWORK_ERROR"
 ERROR_SELECTOR = "SELECTOR_BROKEN"
 ERROR_DEP = "TOOL_MISSING_DEPENDENCY"
+ERROR_IMAGE_INVALID = "IMAGE_INVALID"
+ERROR_IMAGE_UPLOAD_FAILED = "IMAGE_UPLOAD_FAILED"
 ERROR_UNKNOWN = "UNKNOWN_ERROR"
+
+# 微博桌面网页版图片上传限制
+MAX_IMAGES_PER_POST = 9
+MAX_IMAGES_PER_COMMENT = 1  # 桌面网页版评论/回复一次只能带 1 张图
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+IMAGE_SOFT_SIZE_WARN_MB = 5
+IMAGE_HARD_SIZE_LIMIT_MB = 20  # 单张超过这个就直接拒绝，避免漫长等待后失败
 
 WRITE_ACTIONS = {"post", "comment", "reply-comment", "repost", "like", "unlike", "delete-post", "delete-comment"}
 
@@ -1109,23 +1118,401 @@ class WeiboSession:
             raise ToolError(ERROR_PUBLISH_FAILED, "微博页面提示发送/发布失败或操作频繁。")
         return signal
 
+    def _validate_image_paths(self, images: List[str], max_count: int) -> List[str]:
+        """检查每张图片是否存在、扩展名是否合规、是否超过硬上限，返回绝对路径列表。
+
+        max_count: 该写操作允许的最大张数（post=9，comment/reply=1）。
+        超过 IMAGE_SOFT_SIZE_WARN_MB 不会失败，只会在 warnings 里提示；超过
+        IMAGE_HARD_SIZE_LIMIT_MB 直接 raise，避免上传一半才被微博拒。
+        """
+        if not images:
+            return []
+        if len(images) > max_count:
+            raise ToolError(
+                ERROR_IMAGE_INVALID,
+                f"一次最多上传 {max_count} 张图，收到 {len(images)} 张。",
+                data={"received": len(images), "max": max_count},
+            )
+        seen: set = set()
+        out: List[str] = []
+        for raw in images:
+            if not raw or not str(raw).strip():
+                raise ToolError(ERROR_IMAGE_INVALID, "图片路径为空。")
+            p = Path(str(raw)).expanduser()
+            try:
+                p = p.resolve(strict=False)
+            except Exception:
+                pass
+            if not p.exists():
+                raise ToolError(
+                    ERROR_IMAGE_INVALID,
+                    f"图片不存在：{p}",
+                    data={"path": str(p)},
+                )
+            if not p.is_file():
+                raise ToolError(
+                    ERROR_IMAGE_INVALID,
+                    f"不是一个普通文件：{p}",
+                    data={"path": str(p)},
+                )
+            ext = p.suffix.lower()
+            if ext not in ALLOWED_IMAGE_EXTS:
+                raise ToolError(
+                    ERROR_IMAGE_INVALID,
+                    f"扩展名 {ext or '(无)'} 不在支持的图片格式列表里 {sorted(ALLOWED_IMAGE_EXTS)}：{p}",
+                    data={"path": str(p), "ext": ext},
+                )
+            try:
+                size_mb = p.stat().st_size / (1024 * 1024)
+            except Exception:
+                size_mb = 0.0
+            if size_mb > IMAGE_HARD_SIZE_LIMIT_MB:
+                raise ToolError(
+                    ERROR_IMAGE_INVALID,
+                    f"图片过大（{size_mb:.1f} MB > {IMAGE_HARD_SIZE_LIMIT_MB} MB）：{p}",
+                    data={"path": str(p), "size_mb": round(size_mb, 2)},
+                )
+            key = str(p)
+            if key in seen:
+                # 同一路径重复出现不算硬错误，但会被去重
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    def _collect_image_warnings(self, paths: List[str]) -> List[str]:
+        warnings: List[str] = []
+        for raw in paths:
+            try:
+                size_mb = Path(raw).stat().st_size / (1024 * 1024)
+            except Exception:
+                continue
+            if size_mb > IMAGE_SOFT_SIZE_WARN_MB:
+                warnings.append(
+                    f"图片 {Path(raw).name} 约 {size_mb:.1f} MB，超过 {IMAGE_SOFT_SIZE_WARN_MB} MB，"
+                    "微博可能压缩或拒绝。"
+                )
+        return warnings
+
+    async def _find_visible_file_input(self):
+        """在当前页面查找一个看起来是图片用的 input[type=file]。
+
+        微博桌面网页版的图片上传通常用一个隐藏的 input[type=file]。它对用户不可见，
+        但 Playwright 可以直接 set_input_files()。
+
+        重要：weibo.com 上常常同时挂着多个 input[type=file]（顶部发微博撰写器、
+        评论撰写器、转发撰写器…）。如果选错了，图片就会附到错误的撰写器上。所以
+        优先选择"和当前最近被填过/聚焦的文本框处于同一撰写器容器里"的那个，再退
+        化到 accept 含 image 的，最后兜底任选一个。
+        """
+        page = await self.ensure_page()
+        # 用 JS 直接挑选：先找最近被聚焦或刚填过文字的 contenteditable / textarea，
+        # 向上走 6 层找一个公共容器，里面是否有 input[type=file]；有就取它。
+        scoped_handle = None
+        try:
+            scoped_handle = await page.evaluate_handle(
+                r"""
+                () => {
+                  const editors = Array.from(document.querySelectorAll(
+                    '[contenteditable="true"], textarea'
+                  )).filter(el => {
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    if (r.width < 30 || r.height < 10) return false;
+                    if (st.visibility === 'hidden' || st.display === 'none') return false;
+                    return true;
+                  });
+                  // 优先：document.activeElement
+                  let pick = null;
+                  if (document.activeElement && editors.includes(document.activeElement)) {
+                    pick = document.activeElement;
+                  }
+                  // 否则：有内容的第一个
+                  if (!pick) {
+                    pick = editors.find(el => {
+                      const v = ('value' in el ? el.value : el.innerText) || '';
+                      return v.trim().length > 0;
+                    });
+                  }
+                  // 否则：取第一个可见的
+                  if (!pick) pick = editors[0];
+                  if (!pick) return null;
+                  // 向上走 6 层，找含 input[type=file] 的祖先
+                  let n = pick;
+                  for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+                    const inputs = n.querySelectorAll('input[type="file"]');
+                    if (inputs.length > 0) {
+                      // 优先 accept 含 image 的
+                      for (const inp of inputs) {
+                        const a = (inp.getAttribute('accept') || '').toLowerCase();
+                        if (a.includes('image')) return inp;
+                      }
+                      return inputs[0];
+                    }
+                  }
+                  return null;
+                }
+                """
+            )
+        except Exception:
+            scoped_handle = None
+
+        if scoped_handle:
+            try:
+                # JSHandle → ElementHandle 转换
+                el_handle = scoped_handle.as_element() if hasattr(scoped_handle, "as_element") else scoped_handle
+                if el_handle is not None:
+                    # 简单的存在性检查：拿 outerHTML 失败就当没找到
+                    try:
+                        await el_handle.evaluate("el => el && el.tagName")
+                        return el_handle
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 退化：用 Locator 全局找
+        loc = page.locator('input[type="file"]')
+        try:
+            count = await loc.count()
+        except Exception:
+            count = 0
+        if count == 0:
+            return None
+        with_image_accept = []
+        without_accept = []
+        for i in range(min(count, 12)):
+            cand = loc.nth(i)
+            try:
+                accept = (await cand.get_attribute("accept")) or ""
+            except Exception:
+                accept = ""
+            if "image" in accept.lower():
+                with_image_accept.append(cand)
+            elif accept == "":
+                without_accept.append(cand)
+        if with_image_accept:
+            return with_image_accept[0]
+        if without_accept:
+            return without_accept[0]
+        return loc.first
+
+    async def _click_image_upload_button(self) -> bool:
+        """点击撰写区域里"图片"按钮，触发 file chooser 或激活隐藏 input。
+
+        微博桌面网页版改版频繁，按钮可能是 svg 图标、按钮、链接或 div。这里多种
+        选择器组合尝试，命中一个就返回 True。
+        """
+        page = await self.ensure_page()
+        selectors = [
+            'button[aria-label*="图片"]',
+            '[role="button"][aria-label*="图片"]',
+            'button[title*="图片"]',
+            '[title*="图片"]',
+            'button[aria-label*="照片"]',
+            '[role="button"][aria-label*="照片"]',
+            '[class*="picUpload"]',
+            '[class*="PicUpload"]',
+            '[class*="pic-upload"]',
+            '[class*="pic_upload"]',
+            '[class*="ImageUpload"]',
+            '[class*="image-upload"]',
+            '[class*="Picture_"]',
+            'button:has-text("图片")',
+            '[role="button"]:has-text("图片")',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible(timeout=500):
+                    await loc.click(timeout=2000)
+                    await asyncio.sleep(0.4)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _wait_for_image_thumbnails(self, expected: int, seconds: int = 25) -> int:
+        """轮询页面上是否出现 >= expected 张刚上传的图片缩略图。
+
+        识别策略：blob:/data: URL 一般是本地预览，sinaimg.cn 是已上传到微博 CDN
+        的图。把这两类都算作"已附加"。还兜底匹配带图片上传相关 class 的容器里的
+        img 元素。
+
+        返回观察到的缩略图数量。永不抛错——这只是个补强信号。
+        """
+        page = await self.ensure_page()
+        deadline = time.time() + seconds
+        js = r"""
+        () => {
+          const seen = new Set();
+          let count = 0;
+          // 1) 撰写区域里"刚上传"的 img
+          const imgs = document.querySelectorAll('img');
+          for (const img of imgs) {
+            const src = img.getAttribute('src') || img.src || '';
+            if (!src || seen.has(src)) continue;
+            const isLocalPreview = src.startsWith('blob:') || src.startsWith('data:image/');
+            const isWeiboCdn = /sinaimg\.(cn|com\.cn)/.test(src) || /wbpic|wxpic/.test(src);
+            if (!isLocalPreview && !isWeiboCdn) continue;
+            // 排除头像/表情：尺寸 < 40 通常是 icon
+            const r = img.getBoundingClientRect();
+            if (r.width < 40 || r.height < 40) continue;
+            // 必须在撰写器/上传容器附近，避免数到正文里别人的微博图
+            let n = img; let ok = false;
+            for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
+              const cls = (n.className && (typeof n.className === 'string' ? n.className : n.className.baseVal)) || '';
+              if (/composer|Composer|publisher|Publisher|upload|Upload|picUpload|PicUpload|picture-upload|imgArea|ImgArea|woo-picture-img/i.test(cls)) {
+                ok = true; break;
+              }
+              const role = n.getAttribute && n.getAttribute('role');
+              if (role === 'dialog' && /发微博|发布|评论/.test((n.innerText || '').slice(0, 40))) {
+                ok = true; break;
+              }
+            }
+            if (!ok) continue;
+            seen.add(src);
+            count++;
+          }
+          return count;
+        }
+        """
+        last = 0
+        while time.time() < deadline:
+            try:
+                last = await page.evaluate(js)
+            except Exception:
+                last = 0
+            if last >= expected:
+                await asyncio.sleep(0.6)  # 给最后一张图的 CDN 上传一点缓冲
+                return last
+            await asyncio.sleep(0.6)
+        return last
+
+    async def attach_images_to_composer(
+        self,
+        images: List[str],
+        *,
+        purpose: str = "post",
+        max_count: int = MAX_IMAGES_PER_POST,
+    ) -> dict:
+        """把图片附加到当前可见的撰写器。
+
+        策略：
+          1) 先尝试直接在页面里找 input[type=file]，用 set_input_files() 一把传入。
+             绝大多数情况这一步就够，不需要触发 file chooser。
+          2) 如果页面里没有 input[type=file]（被 lazy mount 了），点击"图片"按钮
+             并通过 page.expect_file_chooser() 捕获文件选择对话框，再 set_files()。
+          3) 等缩略图出现，作为"图片已接受"的补强信号。
+
+        返回 {"attached": n, "warnings": [...], "method": "input|file_chooser"}
+        """
+        validated = self._validate_image_paths(images, max_count=max_count)
+        if not validated:
+            return {"attached": 0, "warnings": [], "method": "none"}
+        size_warnings = self._collect_image_warnings(validated)
+        page = await self.ensure_page()
+        method = "input"
+        # ---- 1) 直接 set_input_files ----
+        file_input = await self._find_visible_file_input()
+        if file_input is not None:
+            try:
+                await file_input.set_input_files(validated, timeout=self.opts.timeout_ms)
+            except Exception as exc:
+                await self.debug_dump(
+                    f"{purpose}_image_set_input_failed",
+                    {"error": f"{type(exc).__name__}: {exc}", "paths": validated},
+                )
+                file_input = None  # fall through to file chooser path
+        # ---- 2) 兜底：点击"图片"按钮 + expect_file_chooser ----
+        if file_input is None:
+            method = "file_chooser"
+            try:
+                async with page.expect_file_chooser(timeout=10_000) as fc_info:
+                    clicked = await self._click_image_upload_button()
+                    if not clicked:
+                        raise ToolError(
+                            ERROR_SELECTOR,
+                            "未找到图片上传按钮，且页面里也没有可用的 input[type=file]。"
+                            "微博桌面版可能改版，请用 --debug 抓 HTML 修选择器。",
+                        )
+                chooser = await fc_info.value
+                await chooser.set_files(validated)
+            except ToolError:
+                raise
+            except PWTimeout as exc:
+                await self.debug_dump(
+                    f"{purpose}_image_chooser_timeout",
+                    {"error": f"PWTimeout: {exc}", "paths": validated},
+                )
+                raise ToolError(
+                    ERROR_IMAGE_UPLOAD_FAILED,
+                    "点击图片按钮后未能在 10 秒内拿到文件选择对话框，无法上传。",
+                )
+            except Exception as exc:
+                await self.debug_dump(
+                    f"{purpose}_image_upload_failed",
+                    {"error": f"{type(exc).__name__}: {exc}", "paths": validated},
+                )
+                raise ToolError(
+                    ERROR_IMAGE_UPLOAD_FAILED,
+                    f"图片上传失败：{type(exc).__name__}: {exc}",
+                )
+        # ---- 3) 等缩略图出现 ----
+        thumb_count = await self._wait_for_image_thumbnails(len(validated))
+        warnings = list(size_warnings)
+        if thumb_count == 0:
+            await self.debug_dump(
+                f"{purpose}_image_no_thumbnails",
+                {"paths": validated, "method": method},
+            )
+            raise ToolError(
+                ERROR_IMAGE_UPLOAD_FAILED,
+                "图片已交给页面但未观察到任何缩略图出现，疑似被微博拒绝。"
+                "请检查文件是否过大、格式不支持，或当前账号是否被限制上传图片。",
+            )
+        if thumb_count < len(validated):
+            warnings.append(
+                f"只观察到 {thumb_count}/{len(validated)} 张缩略图。"
+                "可能某些图片仍在上传，或被微博静默拒绝。"
+            )
+        return {
+            "attached": len(validated),
+            "thumbnails_detected": thumb_count,
+            "warnings": warnings,
+            "method": method,
+            "paths": validated,
+        }
+
     async def post_status(self, text: str, visibility: str = "public", images: Optional[List[str]] = None) -> dict:
         await self.require_login()
-        if images:
-            raise ToolError(ERROR_PUBLISH_FAILED, "当前桌面版第一版尚未实现图片上传；请先发纯文本，或后续扩展 upload-image。")
         await self.goto(DESKTOP_HOME)
         await self.fill_textbox(text, purpose="post")
+        image_result: dict = {"attached": 0, "warnings": [], "method": "none"}
+        if images:
+            image_result = await self.attach_images_to_composer(
+                images, purpose="post", max_count=MAX_IMAGES_PER_POST,
+            )
         clicked = await self.click_button_by_text(["发布", "发送"])
         if not clicked:
             await self.debug_dump("post_button_not_found")
             raise ToolError(ERROR_PUBLISH_FAILED, "未找到桌面网页版发布按钮。")
-        signal = await self.wait_for_publish_signal(text, seconds=12)
+        # 有图片时给服务端处理多一些时间：每张图最坏 + 3 秒，下限 18 秒。
+        attached = image_result.get("attached", 0) or 0
+        wait_seconds = 12 if attached == 0 else max(18, 12 + attached * 3)
+        signal = await self.wait_for_publish_signal(text, seconds=wait_seconds)
         if signal == "failure":
-            await self.debug_dump("post_publish_failed", {"text": text})
+            await self.debug_dump("post_publish_failed", {"text": text, "attached_images": attached})
             raise ToolError(ERROR_PUBLISH_FAILED, "微博页面提示发布失败或操作频繁。")
         # 历史教训：发完帖立刻去自己 timeline 抓往往抓不到（缓存/页面未刷新/最近微博列表是
         # SPA 状态没更新）。如果 UI 已经给出 success 信号或 textbox 已被清空，就信它，
         # 不再硬性要求能在自己微博列表里 fetch 到。fetch 只作为补强，找不到也只是软警告。
+        image_payload = {
+            "count": attached,
+            "method": image_result.get("method"),
+            "thumbnails_detected": image_result.get("thumbnails_detected"),
+            "paths": image_result.get("paths", []),
+        } if attached else None
         if signal == "success":
             await asyncio.sleep(1)
             match = None
@@ -1137,8 +1524,10 @@ class WeiboSession:
                 match = None
             return {
                 "post": match or {"text": text},
+                "images": image_payload,
                 "verified": True,
                 "verification": "ui_signal" if not match else "ui_signal+fetch",
+                "warnings": list(image_result.get("warnings", [])),
             }
         # signal == "unknown": 软失败 fallback
         await asyncio.sleep(2)
@@ -1156,7 +1545,7 @@ class WeiboSession:
                 items = []
         snippet = text.strip()[:40]
         match = next((it for it in items if snippet and snippet in (it.get("text") or "")), None)
-        warnings: List[str] = []
+        warnings: List[str] = list(image_result.get("warnings", []))
         if not match:
             warnings.append(
                 "未能在自己的近期微博中匹配到该发布内容，且页面没有明确的失败提示。"
@@ -1164,29 +1553,43 @@ class WeiboSession:
             )
             if verify_error:
                 warnings.append(f"自己微博抓取出错：{verify_error}")
-            await self.debug_dump("post_unverified", {"text": text, "recent_items": items[:5], "verify_error": verify_error})
+            await self.debug_dump("post_unverified", {"text": text, "recent_items": items[:5], "verify_error": verify_error, "attached_images": attached})
         return {
             "post": match or {"text": text},
+            "images": image_payload,
             "verified": bool(match),
             "verification": "fetch" if match else "unverified",
             "warnings": warnings,
         }
 
-    async def comment_status(self, post_url_or_id: str, text: str) -> dict:
+    async def comment_status(self, post_url_or_id: str, text: str, images: Optional[List[str]] = None) -> dict:
         await self.require_login()
         url = post_url_or_id if post_url_or_id.startswith("http") else f"https://weibo.com/detail/{parse_weibo_id(post_url_or_id)}"
         await self.goto(url)
         # Open/focus comment area.
         await self.click_button_by_text(["评论"], timeout_ms=3000)
         await self.fill_textbox(text, purpose="comment")
+        image_result: dict = {"attached": 0, "warnings": [], "method": "none"}
+        if images:
+            image_result = await self.attach_images_to_composer(
+                images, purpose="comment", max_count=MAX_IMAGES_PER_COMMENT,
+            )
         clicked = await self.click_button_by_text(["评论", "发布", "发送"])
         if not clicked:
             await self.debug_dump("comment_button_not_found")
             raise ToolError(ERROR_PUBLISH_FAILED, "未找到评论发布按钮。")
-        signal = await self.wait_for_publish_signal(text, seconds=12)
+        attached = image_result.get("attached", 0) or 0
+        wait_seconds = 12 if attached == 0 else max(18, 12 + attached * 3)
+        signal = await self.wait_for_publish_signal(text, seconds=wait_seconds)
         if signal == "failure":
-            await self.debug_dump("comment_publish_failed", {"post_url": url, "text": text})
+            await self.debug_dump("comment_publish_failed", {"post_url": url, "text": text, "attached_images": attached})
             raise ToolError(ERROR_PUBLISH_FAILED, "微博页面提示评论失败或操作频繁。")
+        image_payload = {
+            "count": attached,
+            "method": image_result.get("method"),
+            "thumbnails_detected": image_result.get("thumbnails_detected"),
+            "paths": image_result.get("paths", []),
+        } if attached else None
         # 历史教训：微博评论提交后并不一定会出现在评论区列表的可见位置（按热度排序、
         # 分页、机审延迟、对方关注限制等都会让我们的评论暂时看不见），但它已经发出去了。
         # 因此：UI 信号已经是 success/textbox-cleared 时直接信，不再做硬性 fetch 校验；
@@ -1195,8 +1598,10 @@ class WeiboSession:
         if signal == "success":
             return {
                 "comment": {"post_url": url, "text": text},
+                "images": image_payload,
                 "verified": True,
                 "verification": "ui_signal",
+                "warnings": list(image_result.get("warnings", [])),
             }
         # signal == "unknown": 尝试 fetch 校验，软失败
         await asyncio.sleep(2)
@@ -1207,7 +1612,7 @@ class WeiboSession:
             verified = any(text.strip()[:30] in (c.get("text") or "") for c in detail.get("comments", []))
         except Exception as exc:
             verify_error = f"{type(exc).__name__}: {exc}"
-        warnings: List[str] = []
+        warnings: List[str] = list(image_result.get("warnings", []))
         verification = "fetch" if verified else "unverified"
         if not verified:
             warnings.append(
@@ -1216,15 +1621,16 @@ class WeiboSession:
             )
             if verify_error:
                 warnings.append(f"评论区抓取也失败了：{verify_error}")
-            await self.debug_dump("comment_unverified", {"post_url": url, "text": text, "verify_error": verify_error})
+            await self.debug_dump("comment_unverified", {"post_url": url, "text": text, "verify_error": verify_error, "attached_images": attached})
         return {
             "comment": {"post_url": url, "text": text},
+            "images": image_payload,
             "verified": verified,
             "verification": verification,
             "warnings": warnings,
         }
 
-    async def reply_comment(self, comment_id: str, text: str, post_url: Optional[str] = None, comment_text: Optional[str] = None) -> dict:
+    async def reply_comment(self, comment_id: str, text: str, post_url: Optional[str] = None, comment_text: Optional[str] = None, images: Optional[List[str]] = None) -> dict:
         await self.require_login()
         if comment_id.startswith("http") and not post_url:
             post_url = comment_id
@@ -1262,22 +1668,36 @@ class WeiboSession:
             await self.debug_dump("reply_button_not_found")
             raise ToolError(ERROR_SELECTOR, "未找到评论回复按钮；请提供 --comment-text 或用 debug 文件修选择器。")
         await self.fill_textbox(text, purpose="comment")
+        image_result: dict = {"attached": 0, "warnings": [], "method": "none"}
+        if images:
+            image_result = await self.attach_images_to_composer(
+                images, purpose="reply", max_count=MAX_IMAGES_PER_COMMENT,
+            )
         clicked = await self.click_button_by_text(["回复", "评论", "发布", "发送"])
         if not clicked:
             await self.debug_dump("reply_send_button_not_found")
             raise ToolError(ERROR_PUBLISH_FAILED, "未找到回复发送按钮。")
-        signal = await self.wait_for_publish_signal(text, seconds=12)
+        attached = image_result.get("attached", 0) or 0
+        wait_seconds = 12 if attached == 0 else max(18, 12 + attached * 3)
+        signal = await self.wait_for_publish_signal(text, seconds=wait_seconds)
         if signal == "failure":
-            await self.debug_dump("reply_publish_failed", {"post_url": post_url, "comment_id": comment_id, "text": text})
+            await self.debug_dump("reply_publish_failed", {"post_url": post_url, "comment_id": comment_id, "text": text, "attached_images": attached})
             raise ToolError(ERROR_PUBLISH_FAILED, "微博页面提示回复失败或操作频繁。")
         verified = (signal == "success")
-        warnings: List[str] = []
+        warnings: List[str] = list(image_result.get("warnings", []))
         if not verified:
             warnings.append(
                 "回复已发送但页面没有明确的成功提示。回复在桌面版往往不会立即显示，多数情况下已发出。"
             )
+        image_payload = {
+            "count": attached,
+            "method": image_result.get("method"),
+            "thumbnails_detected": image_result.get("thumbnails_detected"),
+            "paths": image_result.get("paths", []),
+        } if attached else None
         return {
             "reply": {"post_url": post_url, "comment_id": comment_id, "text": text},
+            "images": image_payload,
             "verified": verified,
             "verification": "ui_signal" if verified else "unverified",
             "warnings": warnings,
@@ -1682,27 +2102,35 @@ async def run_action(args, opts: RuntimeOptions) -> dict:
 
         if action == "post":
             text = read_text_file(args.text_file)
-            dedupe = f"post:{sha256_text(text)}"
+            images_arg = getattr(args, "images", None) or None
+            dedupe_extra = ":imgs=" + ",".join(sorted(images_arg)) if images_arg else ""
+            dedupe = f"post:{sha256_text(text)}{dedupe_extra}"
             dup = recent_duplicate(opts, dedupe)
             if dup:
                 return ok_response(action, status="duplicate_skipped", data={"duplicate_of": dup}, debug_artifacts=s.debug_artifacts)
-            data = await s.post_status(text, visibility=args.visibility, images=args.images)
+            data = await s.post_status(text, visibility=args.visibility, images=images_arg)
             append_action_log(opts, {"epoch": time.time(), "action": action, "ok": True, "dedupe_key": dedupe, "result": data})
             return ok_response(action, status=_publish_status_for(data), data=data, warnings=data.get("warnings", []), debug_artifacts=s.debug_artifacts)
         if action == "comment":
             text = read_text_file(args.text_file)
             target = args.post_url or args.id
-            dedupe = f"comment:{target}:{sha256_text(text)}"
+            images_arg = getattr(args, "images", None) or None
+            dedupe_extra = ""
+            if images_arg:
+                dedupe_extra = ":imgs=" + ",".join(sorted(images_arg))
+            dedupe = f"comment:{target}:{sha256_text(text)}{dedupe_extra}"
             dup = recent_duplicate(opts, dedupe)
             if dup:
                 return ok_response(action, status="duplicate_skipped", data={"duplicate_of": dup}, debug_artifacts=s.debug_artifacts)
-            data = await s.comment_status(target, text)
+            data = await s.comment_status(target, text, images=images_arg)
             append_action_log(opts, {"epoch": time.time(), "action": action, "ok": True, "dedupe_key": dedupe, "result": data})
             return ok_response(action, status=_publish_status_for(data), data=data, warnings=data.get("warnings", []), debug_artifacts=s.debug_artifacts)
         if action == "reply-comment":
             text = read_text_file(args.text_file)
-            data = await s.reply_comment(args.comment_id, text, post_url=args.post_url, comment_text=args.comment_text)
-            append_action_log(opts, {"epoch": time.time(), "action": action, "ok": True, "dedupe_key": f"reply:{args.comment_id}:{sha256_text(text)}", "result": data})
+            images_arg = getattr(args, "images", None) or None
+            data = await s.reply_comment(args.comment_id, text, post_url=args.post_url, comment_text=args.comment_text, images=images_arg)
+            dedupe_extra = ":imgs=" + ",".join(sorted(images_arg)) if images_arg else ""
+            append_action_log(opts, {"epoch": time.time(), "action": action, "ok": True, "dedupe_key": f"reply:{args.comment_id}:{sha256_text(text)}{dedupe_extra}", "result": data})
             return ok_response(action, status=_publish_status_for(data), data=data, warnings=data.get("warnings", []), debug_artifacts=s.debug_artifacts)
         if action == "repost":
             text = read_text_file(args.text_file) if args.text_file else "转发微博"
@@ -1791,21 +2219,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-url")
     p.add_argument("--limit", type=int, default=20)
 
-    p = addp("post", help="发纯文本微博。")
+    p = addp("post", help="发微博。--images 最多 9 张图。")
     p.add_argument("--text-file", required=True)
     p.add_argument("--visibility", choices=["public", "followers", "private"], default="public")
-    p.add_argument("--images", nargs="*")
+    p.add_argument("--images", nargs="*", help="附加图片的本地路径列表，最多 9 张。")
 
-    p = addp("comment", help="评论一条微博。")
+    p = addp("comment", help="评论一条微博。--images 最多 1 张图。")
     p.add_argument("--post-url")
     p.add_argument("--id")
     p.add_argument("--text-file", required=True)
+    p.add_argument("--images", nargs="*", help="附加图片的本地路径列表，最多 1 张。")
 
-    p = addp("reply-comment", help="回复评论。桌面版建议提供 --post-url 和 --comment-text。")
+    p = addp("reply-comment", help="回复评论。桌面版建议提供 --post-url 和 --comment-text。--images 最多 1 张图。")
     p.add_argument("--comment-id", required=True)
     p.add_argument("--post-url")
     p.add_argument("--comment-text")
     p.add_argument("--text-file", required=True)
+    p.add_argument("--images", nargs="*", help="附加图片的本地路径列表，最多 1 张。")
 
     p = addp("repost", help="转发微博。")
     p.add_argument("--post-url")

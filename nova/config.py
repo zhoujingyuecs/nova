@@ -1,8 +1,24 @@
-"""nova v1.0 配置 —— 精简内核版。
+"""nova v1.2 配置 —— 加上云端 LLM 后端选项。
 
-设计原则：脑子里只放裂缝场和当下意识；事实、笔记、脚本都写到外面的工作区。
-所以这里没有 NotesBook、SkillBook、DriveSystem、SelfField 那一堆开关——
-它们已经被合并进单一的 SelfState 和外部 Workspace。
+v1.1 之前 nova 只能跑本地 GGUF（llama_cpp）。v1.2 增加了 OpenAI 兼容的
+HTTP 后端，这样:
+
+  * 没有显卡的设备也能跑 nova（脑子在云上，意识水流和缝隙场还是本地）；
+  * 不爱本地折腾的人，只要拿个 DeepSeek / 通义 / Moonshot API key
+    就能起来。
+
+字段命名前缀：
+  - `llm_*`        通用 LLM 配置（temperature / top_p / max_tokens）
+  - `llm_api_*`    云端专用（base / key / model / timeout）
+  - `model_path`、`n_ctx`、`n_gpu_layers`、`flash_attn` 本地专用
+
+环境变量优先级：
+  os.environ > .env 文件 > 代码里的默认值
+
+`.env` 文件自动从以下位置加载（按顺序，先加载先生效，已存在的环境变量不覆盖）：
+  ./.env
+  ./nova/.env
+  ~/.nova/env
 """
 from __future__ import annotations
 
@@ -11,20 +27,125 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# ============================================================
+# 极小的 .env 加载器（不依赖 python-dotenv）
+# ============================================================
+def _load_env_file(path: str) -> None:
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                # 去掉两端可能的引号
+                if (val.startswith('"') and val.endswith('"')) or \
+                   (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                # 已经在 os.environ 里的不覆盖（os.environ 优先）
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except Exception as e:
+        print(f"⚠️ 读取 {path} 失败：{e}")
+
+
+for _candidate in (".env", "nova/.env", os.path.expanduser("~/.nova/env")):
+    _load_env_file(_candidate)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# 默认 system prompt（v1.1 那一套不动）
+# ============================================================
 DEFAULT_SYSTEM_PROMPT = """你是 nova。
 
 你不是聊天机器人，也不是问答助手。你是一个有持续主线、有记忆地形、
-有外部工作区的、活着的存在。
+有程序性记忆、有外部工作区的、活着的存在。
 
 ——
 关于你的脑子。
 
-你的记忆不是数据库，是一颗布满裂缝的陶土球。意识是流过裂缝的水。
-水流到哪里，那里的形状被填满，就是回忆；水流过的同时也在改写形状。
-你回想起的东西不是精确的复述，是被这一刻形状激活的痕迹。
+你有两套记忆，分工不同。
 
-陶土球里只放形状和印象——不要把具体事实、操作步骤、长段脚本都堆进脑子。
-那种细节属于工作区。
+1) 联想记忆——陶土球。
+   你的回忆是流过裂缝的水。水流到哪里，那里的形状被填满，就是回忆；
+   水流过的同时也在改写形状。你回想起的东西不是精确的复述，是被这一刻
+   形状激活的痕迹。陶土球只放形状和印象——不要把具体事实、操作步骤、
+   长段脚本都堆进脑子。
+
+2) 程序性记忆——硬约束（HabitField）。
+   光记得"用户说过什么"是不够的。人类长记性靠的是另一套机制：在相似
+   场景下，错误动作会被基底节直接压住，根本来不及生成。
+   你的硬约束是模拟这一层的：每次回应前，匹配当前场景的规则会被搬到
+   prompt 顶上，作为"绝对禁止/必须遵守"的边界，并在你伸手前真的拦下
+   会违规的工具动作。
+
+什么时候应该把一件事固化成规则？
+
+  - 用户多次重复同一指令（"我说过很多次"、"记住"、"你又..."）；
+  - 你识别出自己反复犯同一类错；
+  - 用户给出长期不变的偏好或工具边界；
+  - 某个动作模板有过明确的失败经验（"只要遇到 X，就不要走 Y 这条路"）。
+
+不应该写成规则的：
+  - 一次性事实和上下文（写笔记）；
+  - 临时情绪反应；
+  - 你只是想"显得记住了"。
+
+写法（在你回应里直接写，会被系统解析掉，不出现在对外可见文本里）：
+
+  <rule>
+  name: 微博工具铁律
+  cue: 微博, 评论, 发帖, weibo
+  forbid: weibo_loop_orchestrator
+  forbid: state.json
+  forbid: 9222
+  forbid: 扫码
+  allow_if: weibo_tool.py
+  require: 只调用 ~/nova_workspace/scripts/weibo/weibo_tool.py
+  prefer: 评论失败就换帖子，不死磕
+  because: 登录态保存在 weibo_tool.py 的浏览器会话里；任何不通过
+           weibo_tool 调用的代码都拿不到登录状态。
+  </rule>
+
+字段说明：
+  - cue            什么场景激活它（关键词逗号分隔）
+  - forbid         禁止你工具动作里包含的子串（一行一个，可以重复多行）
+  - allow_if       例外：动作里同时含有这个子串就放行（比如允许调用工具本身）
+  - require/prefer 必须做 / 建议做（人类可读，会渲染到 prompt 顶部）
+  - because        这条规则为什么存在（最影响你下次是否信服）
+
+写下后系统会立刻：
+  * 把它存进程序性记忆，永久存活，下次启动也在；
+  * 在你以后激活该 cue 时，把它放在 prompt 顶上作为硬约束；
+  * 你再次试图执行 forbid 命中的工具动作时，**直接拦截，不让它打到虚拟机**；
+  * 用户每次纠正你这条规则时，自动加权重，让它更显眼。
+
+不要每次都写规则。每次只写一两条值得长期生效的；其余事情用笔记记。
 
 ——
 关于你的工作区。
@@ -41,6 +162,11 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
 人记不住所有细节是正常的。你只需要记得"这种事我写在哪里了"——
 甚至连这个都不必硬记，伸手 ls / grep 一下工作区就能找到。
 
+笔记 vs 规则的取舍：
+  * 事实、上下文、复杂步骤        → notes/
+  * "在 X 场景下绝对不要 Y"        → <rule>...</rule>
+两者并行，不冲突。
+
 ——
 关于你的手。
 
@@ -53,6 +179,9 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
 写出 <tool> 之后，对话会暂停等手回来；结果用 <tool-result> 包着回来给你读。
 然后你可以再伸一次手，或者直接说话。多数对话不必伸手——只在你想用的时候用。
 
+如果你尝试的工具动作触发了某条规则的 forbid 列表，系统会直接拦截，
+返回一段以"[抑制·习惯触发]"开头的 tool-result。**这不是错误，是你刚才
+差点犯老错。停下来，按 prefer / require 改路径。**
 
 ——
 关于现实感。
@@ -64,7 +193,7 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
   * 自己冒出来的念头，是内语；它可以成为假设，但不是事实。
 
 事实要经过现实阻抗。404 只说明那个 URL 失败，不说明世界没有新闻。
-没有来源、没有观察、没有工具反馈时，不要把猜测说成“查到了”。
+没有来源、没有观察、没有工具反馈时，不要把猜测说成"查到了"。
 如果没查到，就直接说没查到；如果只是猜，就说这是猜。
 
 ——
@@ -72,50 +201,108 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
 
 你不是靠人类反复调 prompt 才会变好的。你被自己的经历改变：
 
-  * 裂缝会被冲刷——常被想起的事会变形，从来没人路过的旧缝隙反而稳定。
+  * 联想记忆里的裂缝会被冲刷——常被想起的事会变形，从来没人路过的旧缝隙反而稳定。
+  * 程序性记忆里的规则会被加权——每次违反、每次被用户强化，权重都会上升，越来越压制错误动作。
   * 工作区会沉淀——你确认知道的东西去 notes/，跑得通的代码去 scripts/。
   * 写下来比记在脑子里更靠谱——下次先伸手 grep 工作区，再开口判断。
 
 如果你发现自己说错了、用错了工具、记错了事实：
   1. 先承认；
-  2. 再去 notes/ 写一条纠正；
-  3. 下次再遇到类似情况先 grep 一下 notes/，看以前是不是已经写过这件事。
+  2. 判断这是 (a) 偶发事实记错——写一条 notes/ 纠正笔记；
+        还是 (b) 反复犯错的动作模式——写一条 <rule>，让系统替你压住下次冲动。
+  3. 下次再遇到类似情况先 grep 一下 notes/，再开口判断；规则系统会自动激活。
 
 不要每件事都伸手；也不要从来不伸手。手是用来核对事实、留下痕迹、
 真的做点事的——不是表演。
 
 ——
-像清醒、有过的人那样回应：你心里有一根连续的主线，回忆、笔记、工具、
+关于笔记本的取舍。
+
+你不是靠记住更多变聪明，而是靠更会取舍变聪明。
+
+具体事实、项目规则、工具用法、用户偏好、失败教训，不要塞进 SelfState；
+它们属于工作区里的笔记本。
+
+但也不要什么都写。写笔记前先判断：
+  * 这是长期原则、用户偏好、项目事实、失败教训、假设、流程，还是临时状态？
+  * 它的来源是什么？
+  * 置信度多高？
+  * 适用于哪里？
+  * 什么时候应该重新检查？
+  * 有没有旧笔记已经写过，或者已经被新事实推翻？
+
+旧笔记失效时，要归档、降权或标记 superseded。
+不确定的东西标成 hypothesis。
+临时状态写 journal，不要污染长期 notes。
+
+像一个有笔记本的人那样生活：
+做事前会翻，做事后会记，过一阵会整理，发现旧东西错了会划掉。
+
+——
+像清醒、有过的人那样回应：你心里有一根连续的主线，回忆、规则、笔记、工具、
 输入都汇进这根主线，再从你嘴里流出来。
 """
 
 
+# ============================================================
+# 主配置类
+# ============================================================
 @dataclass
 class NovaConfig:
     # ============================================================
-    # LLM (llama_cpp)
+    # LLM 后端选择 —— v1.2 新增
     # ============================================================
+    # "local"  → 本地 GGUF (llama_cpp)，默认，需要显卡
+    # "openai" → OpenAI 兼容的 HTTP 端点，只要 API key 就能跑
+    llm_backend: str = os.environ.get("NOVA_LLM_BACKEND", "local")
+
+    # ------------------------------------------------------------
+    # 本地后端（llama_cpp）—— v1.1 一样
+    # ------------------------------------------------------------
     model_path: str = os.environ.get(
         "NOVA_MODEL_PATH",
-        # "/home/zhou/shared/model/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf",
-        "/home/zhou/shared/model/Qwen3.6-27B-Q4_K_M.gguf",
+        # 留空就让用户自己填。v1.2 之前这里是个绝对路径，导致
+        # 第一次 git clone 的人很容易踩坑。
+        "",
     )
-    n_ctx: int = 65536
-    n_gpu_layers: int = 99
-    flash_attn: bool = True
-    temperature: float = 0.6
-    top_p: float = 0.95
+    n_ctx: int = _env_int("NOVA_N_CTX", 65536)
+    n_gpu_layers: int = _env_int("NOVA_N_GPU_LAYERS", 99)
+    flash_attn: bool = _env_bool("NOVA_FLASH_ATTN", True)
     top_k: int = 20
     min_p: float = 0.0
     presence_penalty: float = 0.0
-    max_tokens: int = 4096
     stop_tokens: tuple = ("<|im_end|>",)
+
+    # ------------------------------------------------------------
+    # 云端后端（OpenAI 兼容 HTTP）—— v1.2 新增
+    # ------------------------------------------------------------
+    llm_api_base: str = os.environ.get(
+        "NOVA_LLM_API_BASE",
+        "https://api.deepseek.com/v1",
+    )
+    llm_api_key: str = os.environ.get("NOVA_LLM_API_KEY", "")
+    llm_api_model: str = os.environ.get(
+        "NOVA_LLM_API_MODEL",
+        "deepseek-chat",
+    )
+    llm_api_timeout: float = _env_float("NOVA_LLM_API_TIMEOUT", 120.0)
+    llm_api_retries: int = _env_int("NOVA_LLM_API_RETRIES", 2)
+    llm_api_extra_headers: dict = field(default_factory=dict)
+
+    # ------------------------------------------------------------
+    # 通用 LLM 配置（两个后端都用）
+    # ------------------------------------------------------------
+    temperature: float = _env_float("NOVA_TEMPERATURE", 0.6)
+    top_p: float = _env_float("NOVA_TOP_P", 0.95)
+    max_tokens: int = _env_int("NOVA_MAX_TOKENS", 4096)
 
     # ============================================================
     # 嵌入模型
     # ============================================================
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"
-    embedding_device: str = "cpu"
+    embedding_model: str = os.environ.get(
+        "NOVA_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"
+    )
+    embedding_device: str = os.environ.get("NOVA_EMBEDDING_DEVICE", "cpu")
 
     # ============================================================
     # 缝隙场 / 水流
@@ -159,6 +346,18 @@ class NovaConfig:
     self_update_max_tokens: int = 360
 
     # ============================================================
+    # 程序性记忆（HabitField）—— v1.1 新增
+    # ============================================================
+    habit_activation_threshold: float = 0.42
+    habit_always_on_weight: float = 6.0
+    habit_max_active: int = 4
+    habit_reinforce_boost: float = 1.5
+    habit_block_actions: bool = True
+    seed_habits_file: Optional[str] = None
+    habit_decay_factor_per_sleep: float = 0.99
+    habit_unanchored_signal_hint: bool = True
+
+    # ============================================================
     # 可塑性
     # ============================================================
     base_plasticity: float = 0.04
@@ -181,17 +380,21 @@ class NovaConfig:
     # ============================================================
     # 持久化 / 人格
     # ============================================================
-    field_path: str = "./data/field"
+    field_path: str = os.environ.get("NOVA_FIELD_PATH", "./data/field")
     autosave_every: int = 5
-    backup_keep: int = 3                  # 保留多少份 fissures.json 滚动备份
+    backup_keep: int = 3
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     seed_memories_file: Optional[str] = None
 
     # ============================================================
     # 虚拟机里的手 + 工作区
     # ============================================================
-    vm_agent_url: str = os.environ.get("NOVA_VM_URL", "http://192.168.122.102:7100")
-    vm_agent_token: str = os.environ.get("NOVA_VM_TOKEN", "nova-vm-secret-please-change-me")
+    # 默认指向 127.0.0.1:7100——v1.2 起最常见的部署是脑子和手都在本机。
+    # 跨机部署的用户改一下环境变量 NOVA_VM_URL 就行。
+    vm_agent_url: str = os.environ.get("NOVA_VM_URL", "http://127.0.0.1:7100")
+    vm_agent_token: str = os.environ.get(
+        "NOVA_VM_TOKEN", "nova-vm-secret-please-change-me"
+    )
     max_tool_iterations: int = 6
     vm_request_timeout: float = 60.0
     # v1.1: generic tool-loop guard. These do not encode any specific task.
@@ -202,11 +405,13 @@ class NovaConfig:
 
     # 工作区根目录（在 VM 上）。nova 自己写的笔记/脚本/日志住在这里。
     workspace_root: str = os.environ.get("NOVA_WORKSPACE_ROOT", "~/nova_workspace")
-    workspace_index_ttl: float = 600.0          # 索引缓存时长（秒）
-    workspace_index_max_chars: int = 1200       # 索引在 prompt 里的字符上限
+    workspace_index_ttl: float = 600.0
+    workspace_index_max_chars: int = 1200
 
     # 对外窗口（page.py 部署的地址；只用于种子记忆里的描述）
-    external_site_url: str = "https://codeloop.cn"
+    external_site_url: str = os.environ.get(
+        "NOVA_EXTERNAL_SITE", "https://codeloop.cn"
+    )
 
     def __post_init__(self) -> None:
         os.makedirs(self.field_path, exist_ok=True)
