@@ -1,38 +1,43 @@
-"""nova v1.1 主循环 —— 加上程序性记忆门控。
+"""nova v1.3.1 主循环 —— "前语言念头层" 简化版。
 
-v1.0 的回路只完成了"想起"那一半：
-   感官输入 → 嵌入 → 水流唤起相关裂缝 → 拼 prompt → LLM → 工具 → 反向刻入
+# 起因（v1.3 / v1.3.1 与 v1.2 / v1.1 的区别）
 
-v1.1 在两个位置塞进了"动作管制"那一半：
+v1.2 之前，nova 的"念头"其实就是 LLM 的下一段输出。LLM 写不出的东西，
+nova 连"想"都想不到——一个被骂的人，连"我可以反击"的冲动都不会浮起来。
 
-  (A) prompt 顶部。Nova 的程序性记忆里如果有规则的 cue 命中当前场景，
-      它会被搬到 prompt 最前面，作为"硬约束"——不再混在普通回忆里。
-      规则被违反过越多次、被用户强化过越多次，就越显眼。
+v1.3 第一版尝试在 LLM 之外加一个"念头层"，并给念头团贴 render_policy /
+action_policy 标签。这条思路里有一半是对的（念头先于语言），有一半是
+错的（关键字规则太敏感，几乎所有念头都被打成 forbid，反而压制了 nova）。
 
-  (B) tool 派发前。LLM 的回应里出现 <tool> 块时，HabitGate 先扫一遍
-      当前激活规则的 forbid 列表。命中了就**不真的派发动作**，而是
-      把"你刚才差点违反规则 X"作为 tool result 回灌给 LLM，让它在
-      下一轮重新选路径。这一步对应基底节的 Go / No-Go。
+v1.3.1 把"念头层"留下，把"政策标签"扔掉：
 
-每轮 perceive 做的事（v1.1）：
-  0. 用户输入里如果有"我说了很多次"之类的反复纠正信号，先去找最匹配
-     的旧规则加权（多巴胺式负反馈）；找不到就在 prompt 里塞一段提示，
-     建议 nova 把这条新规则写成 <rule> 块固化下来。
+  - 念头先有：陶土球 + 水流形成 ThoughtCluster（一组激活的裂缝 + 它们的
+    好恶/紧张/行动压力/新颖度/稳定度）。**不调 LLM。**
+  - cluster **没有政策标签**：什么都可以浮起来，什么都可以说。
+  - 动作管制完全在 HabitGate 的 tool 派发层做（这是 v1.1 的机制）。
+  - 是否说话由 LanguageGate 决定（看新颖度 / 压力 / 模式）。
+  - 如果 nova 自己想暂时不展开某类念头的内容，她写 <seal>...</seal>；
+    想拿掉，写 <unseal>...</unseal>。seal 是 nova **自己的偏好清单**，
+    可以随时增删。封印**不挡说话、不挡动作**——只让 prompt 里那一团
+    内容不展开。
+
+每轮 perceive 做的事（v1.3.1）：
+  0. 反复纠正信号检测（与 v1.1 同）
   1. 嵌入 stimulus
-  2. 让水流从 (stimulus + self_state) 出发收集激活缝隙
-  3. **算出当前生效的硬约束（active habits）**
-  4. 拼 prompt：[硬约束] + SelfState + 工作区索引 + 激活缝隙 + 当前对话链 + 输入
-  5. 调一次 LLM；回应里有 <tool>：
-       a. **HabitGate.evaluate**：命中 forbid 就把抑制消息塞回去，不派发；
-          rule.violation_count += 1，rule.weight 上升；
-       b. 否则照旧派发到 VM；
-     最多 max_tool_iterations 次
-  6. 把回应嵌入，反向冲刷激活缝隙；新增 stimulus / response 缝隙到对话链
-  7. **解析回应里的 <rule> 块**：把 nova 自己识别出的硬约束写进 HabitField
-  8. 每 cfg.self_update_every 次 perceive，触发一次轻量 self_state 更新
-  9. 自动存盘
+  2. **clay_tick.tick()**：让水流激活裂缝，形成 / 更新 ThoughtCluster
+       （这一步纯粹陶土球内部运转，不调 LLM，不依赖任何关键字匹配）
+  3. 算激活的硬约束（active habits）—— 仍然只在 tool 层生效
+  4. LanguageGate.decide()：要不要调 LLM？
+  5. 拼 prompt：[硬约束] + [前语言念头] + [封印清单] + SelfState
+                + 工作区索引 + 激活缝隙 + 当前对话链 + 输入
+  6. 调一次 LLM；回应里有 <tool> → HabitGate 评估（不变）；
+     回应里有 <seal>/<unseal> → 更新 SealRegistry
+  7. 把回应嵌入，反向冲刷激活缝隙；新增 stimulus / response 缝隙
+  8. 解析 <rule>，更新 self_state，落盘 cluster + seals
 
-dream / think 走相同路径；走神/主线推进时也享受规则保护。
+think() / dream_step() 走相同的前半段，但末尾会通过 LanguageGate；
+如果 gate 判断"不必说话"，就只更新 cluster 与 SelfState，**返回 None**——
+nova 这一轮没说出口，但她**确实想了**。
 """
 from __future__ import annotations
 
@@ -47,6 +52,7 @@ from typing import Optional
 import numpy as np
 
 from .config import NovaConfig
+from .clay_tick import ClayTickEngine
 from .embedder import Embedder
 from .field import FissureField
 from .fissure import (
@@ -68,6 +74,7 @@ from .habits import (
     extract_rule_blocks,
     strip_rule_blocks,
 )
+from .language_gate import LanguageGate
 from .llm import LocalLLM
 from .persistence import load_field, save_field
 from .perception import (
@@ -82,6 +89,8 @@ from .perception import (
     SOURCE_USER,
 )
 from .self_state import SelfState, SELF_UPDATE_PROMPT, parse_self_update
+from .seal import SealRegistry, extract_seal_blocks, strip_seal_blocks
+from .thought import ThoughtCluster
 from .tools import VMAgent, format_result, parse_actions, strip_actions
 from .task_state import TaskLedger, TASK_SYSTEM_ADDITION
 from .tool_guard import ToolLoopGuard
@@ -167,6 +176,40 @@ class Nova:
                 f"用户强化 {stats['total_reinforcements']} 次。"
             )
 
+        # v1.3.1: 念头层 —— ClayTickEngine + LanguageGate + SealRegistry
+        # ClayTickEngine 在每次 perceive / think 之前转一下陶土球，
+        # 形成 / 更新 ThoughtCluster。它**不依赖 habit_field**，
+        # cluster 没有任何政策标签——动作管制完全在 HabitGate 的 tool 层。
+        # SealRegistry 是 nova 自己写下的"暂时不想展开的念头清单"，
+        # 可以随时增删；封印不挡说话也不挡动作，只让 prompt 里那一团内容不展开。
+        self._clusters_path = os.path.join(self.cfg.field_path, "clusters.json")
+        self.clay_tick_engine = ClayTickEngine(
+            self.field,
+            self.flow_engine,
+            max_clusters=getattr(self.cfg, "clay_max_clusters", 8),
+            decay_factor=getattr(self.cfg, "clay_decay_factor", 0.85),
+            store_path=self._clusters_path,
+        )
+        self.language_gate = LanguageGate(
+            threshold=getattr(self.cfg, "language_gate_threshold", 0.60),
+        )
+        self._seals_path = os.path.join(self.cfg.field_path, "seals.json")
+        self.seal_registry = SealRegistry(store_path=self._seals_path)
+        if self.seal_registry.entries:
+            print(
+                f"🔖 封印清单加载：{len(self.seal_registry.entries)} 条 "
+                "（nova 自己写下的、可以随时拿掉的偏好）。"
+            )
+        # 上次开口说话的时间戳——LanguageGate 会参考"已经沉默多久"
+        self._last_speech_at: float = time.time()
+        # 最近一次 perceive/think 的 gate 决策（给 worklog / 调试用）
+        self.last_gate_decision = None
+        if self.clay_tick_engine.clusters:
+            print(
+                f"💭 念头池加载：{len(self.clay_tick_engine.clusters)} 个 cluster，"
+                f"最高活跃度 {self.clay_tick_engine.stats().get('max_activation', 0):.2f}。"
+            )
+
         # VM hand + workspace
         self.vm_agent: Optional[VMAgent] = None
         if self.cfg.vm_agent_url:
@@ -211,7 +254,16 @@ class Nova:
     # 对外接口
     # ==========================================================
     def perceive(self, stimulus: str) -> str:
-        """感知一段外界输入，给出一次回应。"""
+        """感知一段外界输入，给出一次回应。
+
+        v1.3 顺序：
+          - 把 stimulus 写进陶土球
+          - **clay_tick.tick()**：水流 + 形成 / 更新 ThoughtCluster
+          - 算 active habits
+          - LanguageGate.decide()：本轮要不要调 LLM？（perceive 默认 yes）
+          - 拼 prompt（包含 [前语言念头] 段落）
+          - 调 LLM → 解析 → 落盘
+        """
         with self._lock:
             episode_id = self._get_or_start_episode()
 
@@ -235,111 +287,289 @@ class Nova:
             # 0. 反复纠正信号检测：先一击命中，多巴胺式负反馈
             reinforced_rule, signal_hit = self._maybe_reinforce_from_signal(stimulus)
 
-            # 1. 水流：种子 = stimulus + self_state 形状
+            # 1. 水流入水种子（stimulus + self_state 形状）
             attention_seed = self._compose_attention_seed(stim_shape)
             episode_anchors = self.field.walk_chain_back(stim_fid, k=self.cfg.episode_recall_size)
-            activated = self.flow_engine.flow(
-                attention_seed,
-                recent_history=set(self._recent_history),
-                mandatory_anchors=episode_anchors,
-            )
 
-            # 2. 激活程序性记忆（硬约束）
+            # 2. v1.3.1：先转一下陶土球，形成 / 更新 ThoughtCluster
+            #    （这一步不调 LLM；念头先以前语言的形式浮起来；
+            #    cluster 没有政策标签，动力学只从激活的裂缝读出来）
             active_habits = self._select_active_habits(stimulus, attention_seed)
+            if getattr(self.cfg, "clay_tick_enabled", True):
+                clusters = self.clay_tick_engine.tick(
+                    seed_shape=attention_seed,
+                    stimulus_summary=stimulus[:80],
+                    recent_history=set(self._recent_history),
+                    mandatory_anchors=episode_anchors,
+                )
+                # 复用 cluster 里 primary 的 fissure_ids 作为 activated
+                # ——保持后续"反向冲刷裂缝"、"建立共激活链接"等逻辑可用
+                primary = self.clay_tick_engine.primary()
+                if primary:
+                    activated = [
+                        f for f in (self.field.get(fid) for fid in primary.fissure_ids)
+                        if f is not None
+                    ]
+                else:
+                    activated = self.flow_engine.flow(
+                        attention_seed,
+                        recent_history=set(self._recent_history),
+                        mandatory_anchors=episode_anchors,
+                    )
+            else:
+                # 回退到 v1.2 行为
+                clusters = []
+                activated = self.flow_engine.flow(
+                    attention_seed,
+                    recent_history=set(self._recent_history),
+                    mandatory_anchors=episode_anchors,
+                )
 
-            # 3. 拼 prompt
+            # 3. LanguageGate 决定要不要调 LLM
+            #    perceive 默认 force_llm（有人在等回答），但 sealed-only 时仍可沉默
+            seconds_silent = time.time() - self._last_speech_at
+            force_call = bool(getattr(self.cfg, "force_llm_on_perceive", True))
+            gate_decision = self.language_gate.decide(
+                clusters=clusters,
+                mode="interrupt",
+                user_waiting=True,
+                seconds_since_last_speech=seconds_silent,
+                force_call=force_call,
+            )
+            self.last_gate_decision = gate_decision
+
+            # 4. 拼 prompt（包含 [前语言念头]）
             user_prompt = self._build_prompt(
                 stimulus, stim_fid, activated, episode_id,
                 active_habits=active_habits,
                 signal_hit_unanchored=(signal_hit and reinforced_rule is None),
                 reinforced_rule=reinforced_rule,
+                clusters=clusters,
             )
 
-            # 4. 调 LLM；工具循环里走 HabitGate
-            final_response = self._chat_with_tools(user_prompt, active_habits=active_habits)
+            # 5. 如果 gate 说"不调"（很罕见，因为 perceive 默认 force_call）——
+            #    用一个非常短的模板回执说明 nova 此刻在沉默
+            if not gate_decision.call_llm:
+                primary = self.clay_tick_engine.primary() if clusters else None
+                visible = self._render_silent_response(primary)
+                self._record_response(
+                    stimulus=stimulus,
+                    visible=visible,
+                    activated=activated,
+                    episode_id=episode_id,
+                    raw_response=visible,
+                )
+                return visible
+
+            # 6. 调 LLM；工具循环里走 HabitGate + cluster.action_policy
+            final_response = self._chat_with_tools(
+                user_prompt,
+                active_habits=active_habits,
+                clusters=clusters,
+            )
             final_response = _strip_think_block(final_response)
 
-            # 5. 拿掉 <rule> 块（既保存又不让外部看到）
+            # 7. 拿掉 <rule> 块（既保存又不让外部看到）
             new_rules = self._extract_and_save_rules(final_response, source=HABIT_SOURCE_SELF)
-            visible = strip_rule_blocks(strip_actions(final_response)).strip() or "（沉默。）"
+            # v1.3.1：拿掉 <seal> / <unseal> 块——nova 自己写下的封印清单更新
+            self._apply_seal_blocks(final_response, primary_cluster=self.clay_tick_engine.primary())
+            visible = strip_rule_blocks(strip_seal_blocks(strip_actions(final_response))).strip() or "（沉默。）"
             visible = ToolLoopGuard.compact_visible_text(visible)
 
-            response_percept = self.reality_state.notice_self_response(visible)
-
-            response_shape = self.embedder.embed(visible)
-            self._reshape(activated, visible, response_shape)
-
-            response_fid = self._open_episode_turn(
-                content=visible,
-                shape=response_shape,
-                speaker=SPEAKER_SELF,
+            self._record_response(
+                stimulus=stimulus,
+                visible=visible,
+                activated=activated,
                 episode_id=episode_id,
-                source=response_percept.source,
-                modality=response_percept.modality,
-                kind=response_percept.kind,
-                epistemic_state=response_percept.epistemic_state,
+                raw_response=final_response,
             )
-
-            # 共激活弱链接：被一起想起的几条之间长出微弱暗道
-            activated_ids = [f.id for f in activated]
-            if len(activated_ids) >= 2:
-                self.field.link_chain(
-                    activated_ids,
-                    base_strength=self.cfg.flow_coactivation_link_strength,
-                    decay=0.65,
-                    max_distance=self.cfg.flow_coactivation_distance,
-                    bidirectional=False,
-                )
-            for fid in activated_ids[-self.cfg.flow_coactivation_distance:]:
-                self.field.link(fid, response_fid,
-                                strength_delta=self.cfg.flow_coactivation_link_strength)
-
-            self.field.sync_all()
-            self._tick_autosave()
-
-            for fid in activated_ids:
-                f = self.field.get(fid)
-                if f is None:
-                    continue
-                if f.episode_id and f.episode_id == episode_id:
-                    continue
-                self._recent_history.append(fid)
-
-            # 工作区索引可能因为这一轮 nova 写过笔记/脚本而过期
-            if "<tool" in final_response.lower() and self.workspace.is_available:
-                self.workspace.invalidate()
-
-            # 偶尔更新一次 SelfState；现实感每轮都轻量落盘，避免未完成请求丢失。
-            self._maybe_update_self_state(stimulus, visible, agenda_text="")
-            self.reality_state.save(self._reality_state_path)
-            self.task_ledger.save()
-            # 程序性记忆每轮都落盘（很轻）
-            self.habit_field.save()
-
             return visible
 
-    def think(self, *, max_tokens: Optional[int] = None,
-              prompt_hint: str = "") -> Optional[str]:
-        """没人说话时的一次内向活动（替代 dream_step）。
+    # ----------------------------------------------------------------
+    # 把"开口说完一句话"那段共用逻辑抽出来（v1.3 重构，原本散在 perceive 里）
+    # ----------------------------------------------------------------
+    def _record_response(
+        self,
+        *,
+        stimulus: str,
+        visible: str,
+        activated: list,
+        episode_id: str,
+        raw_response: str,
+    ) -> None:
+        response_percept = self.reality_state.notice_self_response(visible)
+        response_shape = self.embedder.embed(visible)
+        self._reshape(activated, visible, response_shape)
 
-        prompt_hint：可选的 prompt 前缀，runtime 在 goal_pursuit /
-        reflection / orientation 时塞进来当主线指令。"""
+        response_fid = self._open_episode_turn(
+            content=visible,
+            shape=response_shape,
+            speaker=SPEAKER_SELF,
+            episode_id=episode_id,
+            source=response_percept.source,
+            modality=response_percept.modality,
+            kind=response_percept.kind,
+            epistemic_state=response_percept.epistemic_state,
+        )
+
+        activated_ids = [f.id for f in activated]
+        if len(activated_ids) >= 2:
+            self.field.link_chain(
+                activated_ids,
+                base_strength=self.cfg.flow_coactivation_link_strength,
+                decay=0.65,
+                max_distance=self.cfg.flow_coactivation_distance,
+                bidirectional=False,
+            )
+        for fid in activated_ids[-self.cfg.flow_coactivation_distance:]:
+            self.field.link(fid, response_fid,
+                            strength_delta=self.cfg.flow_coactivation_link_strength)
+
+        self.field.sync_all()
+        self._tick_autosave()
+        # v1.3：cluster 也落盘
+        try:
+            self.clay_tick_engine.save()
+        except Exception:
+            pass
+
+        for fid in activated_ids:
+            f = self.field.get(fid)
+            if f is None:
+                continue
+            if f.episode_id and f.episode_id == episode_id:
+                continue
+            self._recent_history.append(fid)
+
+        if "<tool" in (raw_response or "").lower() and self.workspace.is_available:
+            self.workspace.invalidate()
+
+        self._maybe_update_self_state(stimulus, visible, agenda_text="")
+        self.reality_state.save(self._reality_state_path)
+        self.task_ledger.save()
+        self.habit_field.save()
+
+        # 真说出口了才更新 last_speech_at
+        if visible and visible.strip() and visible.strip() != "（沉默。）":
+            self._last_speech_at = time.time()
+
+    # ----------------------------------------------------------------
+    # v1.3：gate 说不必说话时的"模板回执"
+    # ----------------------------------------------------------------
+    def _render_silent_response(self, primary: Optional[ThoughtCluster]) -> str:
+        """LanguageGate 决定本轮不调 LLM 时，用一个非常短的模板回执。
+
+        模板里只描述"前语言层发生了什么"，不假装在思考、不编造内容。
+        多数情况下 perceive 不会走到这条路径（user_waiting 默认 force_call）；
+        这是给 force_llm_on_perceive=False 的高级用户准备的。
+        """
+        if not primary:
+            return "（这一轮我没说出口，念头也没有特别浮起来。）"
+        tmpl = getattr(
+            self.cfg,
+            "silent_think_template",
+            "（这一轮没说出口。念头团已更新：{primary_summary}）",
+        )
+        try:
+            return tmpl.format(
+                primary_summary=primary.summary or "（无标签）",
+                primary_activation=primary.activation,
+                primary_valence=primary.valence,
+                primary_arousal=primary.arousal,
+                primary_pressure=primary.agency_pressure,
+            )
+        except (KeyError, ValueError):
+            return "（这一轮我没说出口。念头团已更新。）"
+
+    def think(self, *, max_tokens: Optional[int] = None,
+              prompt_hint: str = "",
+              mode: str = "dream",
+              force_speak: bool = False) -> Optional[str]:
+        """没人说话时的一次内向活动。
+
+        v1.3 改造：
+          - 先 clay_tick.tick()，让陶土球转一下、形成 / 更新 cluster
+          - LanguageGate 决定要不要把这次内向活动翻译成话
+          - gate 说不必：只更新 cluster 与 SelfState，返回 None
+            （nova 确实想了，但没说出口）
+          - gate 说要：照旧拼 prompt 走 LLM
+
+        参数：
+          mode：dream / reflect / orient / goal —— 给 LanguageGate 当语境
+          force_speak：强制走 LLM（reflection 显式要求时用）
+        """
         with self._lock:
             if len(self.field) < 1:
                 return None
             seed_shape = self._dream_seed()
             attention_seed = self._compose_attention_seed(seed_shape)
 
-            activated = self.flow_engine.flow(
-                attention_seed,
-                recent_history=set(self._recent_history),
-            )
+            # v1.3.1：先转一下陶土球
+            active_habits = self._select_active_habits(prompt_hint, attention_seed)
+            if getattr(self.cfg, "clay_tick_enabled", True):
+                clusters = self.clay_tick_engine.tick(
+                    seed_shape=attention_seed,
+                    stimulus_summary=(prompt_hint or "")[:80],
+                    recent_history=set(self._recent_history),
+                )
+                primary = self.clay_tick_engine.primary()
+                if primary:
+                    activated = [
+                        f for f in (self.field.get(fid) for fid in primary.fissure_ids)
+                        if f is not None
+                    ]
+                else:
+                    activated = self.flow_engine.flow(
+                        attention_seed,
+                        recent_history=set(self._recent_history),
+                    )
+            else:
+                clusters = []
+                activated = self.flow_engine.flow(
+                    attention_seed,
+                    recent_history=set(self._recent_history),
+                )
+
             if not activated:
                 return None
 
-            # 内向活动也享受规则保护：种子 + prompt_hint 组成上下文
-            active_habits = self._select_active_habits(prompt_hint, attention_seed)
+            # v1.3：LanguageGate 决定要不要调 LLM
+            # think 是内向活动，user_waiting = False —— 默认偏沉默
+            seconds_silent = time.time() - self._last_speech_at
+            gate_decision = self.language_gate.decide(
+                clusters=clusters,
+                mode=mode,
+                user_waiting=False,
+                seconds_since_last_speech=seconds_silent,
+                force_call=force_speak,
+            )
+            self.last_gate_decision = gate_decision
 
+            if not gate_decision.call_llm and getattr(self.cfg, "silent_think_enabled", True):
+                # —— 沉默路径：不调 LLM，只让 cluster 沉淀 + 更新 SelfState ——
+                self.field.sync_all()
+                self._tick_autosave()
+                try:
+                    self.clay_tick_engine.save()
+                except Exception:
+                    pass
+                self.reality_state.save(self._reality_state_path)
+                self.task_ledger.save()
+                self.habit_field.save()
+                # 不更新 last_speech_at —— 因为没说出口
+                # SelfState 也轻量更新一下，反映"刚才在想什么"
+                primary = self.clay_tick_engine.primary() if clusters else None
+                if primary:
+                    self.self_state.apply_update(
+                        recent_summary=f"（前语言层）{primary.summary}",
+                    )
+                    try:
+                        self.self_state.save(self._self_state_path)
+                    except Exception:
+                        pass
+                return None
+
+            # —— 说话路径：调 LLM 把当前的 cluster 翻译成话 ——
             memories = "\n".join(
                 f"- {self._format_recall_line(f, in_episode=False)}"
                 for f in activated
@@ -350,12 +580,16 @@ class Nova:
             workspace_block = self._render_workspace_block()
             workspace_block = NOTEBOOK_HABIT_BLOCK.strip() + "\n\n" + workspace_block
             habit_block = self._render_habit_block(active_habits)
+            cluster_block = self._render_cluster_block(clusters)
             base_prompt = DREAM_PROMPT_BASE.format(
                 habit_block=habit_block,
                 memories=memories,
                 state_block=state_block,
                 workspace_block=workspace_block,
             )
+            # 把前语言念头段拼到 prompt 顶上（紧挨在 habit_block 之后）
+            if cluster_block:
+                base_prompt = cluster_block + "\n\n" + base_prompt
             if prompt_hint:
                 user_prompt = prompt_hint.rstrip() + "\n\n" + base_prompt
             else:
@@ -365,10 +599,12 @@ class Nova:
                 user_prompt,
                 max_tokens=max_tokens or self.cfg.daydream_max_tokens,
                 active_habits=active_habits,
+                clusters=clusters,
             )
             thought_raw = _strip_think_block(thought_raw)
             self._extract_and_save_rules(thought_raw, source=HABIT_SOURCE_SELF)
-            thought = strip_rule_blocks(strip_actions(thought_raw)).strip()
+            self._apply_seal_blocks(thought_raw, primary_cluster=self.clay_tick_engine.primary())
+            thought = strip_rule_blocks(strip_seal_blocks(strip_actions(thought_raw))).strip()
             thought = ToolLoopGuard.compact_visible_text(thought)
             if not thought:
                 return None
@@ -401,6 +637,10 @@ class Nova:
 
             self.field.sync_all()
             self._tick_autosave()
+            try:
+                self.clay_tick_engine.save()
+            except Exception:
+                pass
             for fid in activated_ids:
                 self._recent_history.append(fid)
 
@@ -411,7 +651,33 @@ class Nova:
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
             self.habit_field.save()
+            self._last_speech_at = time.time()
             return thought
+
+    # ----------------------------------------------------------------
+    # 纯 clay tick（runtime 在 idle/dream 时调用——完全不调 LLM）
+    # ----------------------------------------------------------------
+    def clay_tick(self, *, prompt_hint: str = "") -> Optional[ThoughtCluster]:
+        """让陶土球转一下，不调 LLM，不写新 fissure。
+
+        返回当前最亮的 ThoughtCluster（或 None）。
+        runtime 在 idle / 部分 dream 走这个，比 think() 便宜得多。
+        """
+        with self._lock:
+            if len(self.field) < 1:
+                return None
+            seed_shape = self._dream_seed()
+            attention_seed = self._compose_attention_seed(seed_shape)
+            self.clay_tick_engine.tick(
+                seed_shape=attention_seed,
+                stimulus_summary=(prompt_hint or "")[:80],
+                recent_history=set(self._recent_history),
+            )
+            try:
+                self.clay_tick_engine.save()
+            except Exception:
+                pass
+            return self.clay_tick_engine.primary()
 
     # 兼容旧 API ——
     def dream_step(self, max_tokens: Optional[int] = None) -> Optional[str]:
@@ -426,11 +692,26 @@ class Nova:
             # 程序性记忆也跟着衰减
             decayed = self.habit_field.decay(self.cfg.habit_decay_factor_per_sleep)
             stats["habits_decayed"] = decayed
+            # v1.3：sleep 时让 cluster 也衰减一轮——多数会就此淡出，
+            #       只有稳定度高、还在被反复激活的会留下来。
+            try:
+                # 多走几步衰减相当于 sleep 期间不再被激活
+                for _ in range(3):
+                    self.clay_tick_engine._decay_all()
+                self.clay_tick_engine._prune()
+                self.clay_tick_engine.save()
+                stats["clusters_alive"] = len(self.clay_tick_engine.alive())
+            except Exception:
+                pass
             self.habit_field.save()
             save_field(self.field, keep_backup=self.cfg.backup_keep)
             self.self_state.save(self._self_state_path)
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
+            try:
+                self.seal_registry.save()
+            except Exception:
+                pass
             return stats
 
     def visualize(self, output_path: str, method: str = "pca", **kwargs) -> Optional[str]:
@@ -445,14 +726,28 @@ class Nova:
             self.reality_state.save(self._reality_state_path)
             self.task_ledger.save()
             self.habit_field.save()
+            try:
+                self.clay_tick_engine.save()
+            except Exception:
+                pass
+            try:
+                self.seal_registry.save()
+            except Exception:
+                pass
 
     # ==========================================================
     # Prompt / LLM / tools
     # ==========================================================
     def _chat_with_tools(self, initial_user: str,
                          max_tokens: Optional[int] = None,
-                         active_habits: Optional[list[HabitRule]] = None) -> str:
+                         active_habits: Optional[list[HabitRule]] = None,
+                         clusters: Optional[list[ThoughtCluster]] = None) -> str:
+        # v1.3.1：clusters 参数保留只是为了将来如果想做"念头层日志"，
+        # 当前这一层**完全不基于 cluster 做动作拦截**——动作管制全在
+        # HabitGate 的 forbid 列表，那是 nova 自己写下的规则。
         active_habits = active_habits or []
+        _ = clusters  # 当前未使用
+
         system = self.cfg.system_prompt + "\n" + SENSORY_SYSTEM_ADDITION
         if getattr(self.cfg, "task_state_prompt_enabled", True):
             system += "\n" + TASK_SYSTEM_ADDITION
@@ -570,7 +865,8 @@ class Nova:
                       *,
                       active_habits: Optional[list[HabitRule]] = None,
                       signal_hit_unanchored: bool = False,
-                      reinforced_rule: Optional[HabitRule] = None) -> str:
+                      reinforced_rule: Optional[HabitRule] = None,
+                      clusters: Optional[list[ThoughtCluster]] = None) -> str:
         in_episode: list[Fissure] = []
         others: list[Fissure] = []
         for f in activated:
@@ -599,6 +895,18 @@ class Nova:
                 f"这是它存在的根据：{reinforced_rule.rationale or '（你自己写下的硬约束）'}。\n"
                 "请把它当作下一步动作的边界来选路径，而不是当作普通笔记。"
             )
+
+        # v1.3.1：[前语言念头] —— 紧跟硬约束之后，比 SelfState 还靠前
+        # 因为 nova 应该先看到"我现在脑子里浮起来什么"，再去看"我是谁"。
+        cluster_text = self._render_cluster_block(clusters)
+        if cluster_text:
+            sections.append(cluster_text)
+
+        # v1.3.1：[我自己写下的封印清单] —— 让 nova 随时看见
+        # "我之前用 <seal> 封印过哪些"，方便她随时 <unseal> 拿掉。
+        seal_text = self._render_seal_block()
+        if seal_text:
+            sections.append(seal_text)
 
         sections.append(self.self_state.render_for_prompt())
         sections.append(NOTEBOOK_HABIT_BLOCK)
@@ -653,6 +961,35 @@ class Nova:
         if not text:
             return ""
         return text + "\n\n" if trailing_blank else text
+
+    def _render_cluster_block(self,
+                              clusters: Optional[list[ThoughtCluster]]) -> str:
+        """v1.3.1：渲染当前活念头团给 LLM 看。
+
+        关键：LLM 看到这个段落时，应该意识到自己**不是**在生成念头，
+        而是在**翻译**已经在 nova 心里浮起来的念头。
+
+        如果有 cluster 被 nova 自己的 seal 标过，那一团只显示标签，
+        不展开内容——这是 nova 自己写下的偏好，不是任何外部规则。
+        """
+        if not clusters:
+            return ""
+        try:
+            return self.clay_tick_engine.render_for_prompt(
+                max_chars=1500,
+                fissure_lookup=self.field.get,
+                seal_registry=self.seal_registry,
+            )
+        except Exception:
+            return ""
+
+    def _render_seal_block(self) -> str:
+        """渲染当前生效的封印清单——给 nova 自己看，
+        让她随时能看到"我之前定过哪些 seal、可以拿掉哪些"。"""
+        try:
+            return self.seal_registry.render_for_prompt(max_chars=600)
+        except Exception:
+            return ""
 
     # ==========================================================
     # 程序性记忆相关辅助
@@ -727,6 +1064,40 @@ class Nova:
                 print(f"📜 新规则已写入程序性记忆：{rule.name} (id={rule.id}, weight={rule.weight:.2f})")
                 out.append(rule)
         return out
+
+    def _apply_seal_blocks(self, response_text: str,
+                           primary_cluster: Optional[ThoughtCluster] = None) -> None:
+        """从 nova 的回应里抓 <seal> / <unseal> 块，更新 SealRegistry。
+
+        seal 是 nova **自己**写下的偏好——"我不想反复咀嚼某类念头的内容"。
+        unseal 也是 nova 自己写的——"那个我之前封的，我现在想拿掉"。
+        这两个都不挡说话也不挡动作，只影响 prompt 里那一团是否展开。
+        """
+        if not response_text:
+            return
+        new_seals, unseal_specs = extract_seal_blocks(response_text)
+        for entry in new_seals:
+            # 留底：封它的时候活着的 primary cluster id
+            if primary_cluster is not None and not entry.origin_thought_id:
+                entry.origin_thought_id = primary_cluster.id
+            self.seal_registry.add(entry)
+            print(
+                f"🔖 nova 写下新封印：{entry.short_label()}"
+                + (f"（{entry.reason[:40]}）" if entry.reason else "")
+            )
+        for spec in unseal_specs:
+            removed = self.seal_registry.remove_matching(
+                keywords=spec.get("keywords") or [],
+                fingerprint=spec.get("fingerprint") or "",
+                entry_id=spec.get("entry_id") or "",
+            )
+            for r in removed:
+                print(f"🔖 nova 拿掉封印：{r.short_label()}")
+        if new_seals or unseal_specs:
+            try:
+                self.seal_registry.save()
+            except Exception:
+                pass
 
     # ==========================================================
     # Episode / 对话链

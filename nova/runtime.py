@@ -225,6 +225,23 @@ class ContinuousRuntime(threading.Thread):
                 data["habits"] = habit_field.stats()
             except Exception:
                 pass
+        # v1.3：暴露念头层状态
+        clay_engine = getattr(self.nova, "clay_tick_engine", None)
+        if clay_engine is not None:
+            try:
+                data["clusters"] = clay_engine.stats()
+            except Exception:
+                pass
+        last_gate = getattr(self.nova, "last_gate_decision", None)
+        if last_gate is not None:
+            try:
+                data["last_gate"] = {
+                    "call_llm": last_gate.call_llm,
+                    "score": last_gate.score,
+                    "reasons": last_gate.reasons,
+                }
+            except Exception:
+                pass
         return data
 
     def status_text(self) -> str:
@@ -267,6 +284,20 @@ class ContinuousRuntime(threading.Thread):
                 f"习惯：active={habits.get('active', 0)} "
                 f"violations={habits.get('total_violations', 0)} "
                 f"reinforced={habits.get('total_reinforcements', 0)}"
+            )
+        clusters = state.get("clusters") or {}
+        if clusters:
+            parts.append(
+                f"念头：alive={clusters.get('alive', 0)} "
+                f"max_act={clusters.get('max_activation', 0):.2f} "
+                f"sealed={clusters.get('sealed_count', 0)} "
+                f"forbid={clusters.get('forbidden_count', 0)}"
+            )
+        last_gate = state.get("last_gate") or {}
+        if last_gate:
+            verdict = "调 LLM" if last_gate.get("call_llm") else "保持沉默"
+            parts.append(
+                f"语言门：上次决策={verdict} (score={last_gate.get('score', 0):.2f})"
             )
         return "\n".join(parts)
 
@@ -406,7 +437,8 @@ class ContinuousRuntime(threading.Thread):
             agenda_text=self.agenda.summary_text(limit=10),
         )
         # 主线推进用 think 而不是 perceive：是 nova 自己在做事，不是被外人问
-        response = self._call_think(prompt)
+        # v1.3：mode=goal，force_speak=True —— 必须拿到控制行
+        response = self._call_think(prompt, mode="goal", force_speak=True)
         status, summary, next_action = self._parse_control_response(response)
         summary = summary or response[:300]
 
@@ -436,7 +468,8 @@ class ContinuousRuntime(threading.Thread):
             item,
             recent_work=self.worklog.summary_text(limit=12),
         )
-        response = self._call_think(prompt)
+        # v1.3：mode=reflect。reflection 默认必须说出来，所以 force_speak=True。
+        response = self._call_think(prompt, mode="reflect", force_speak=True)
         status, summary, next_action = self._parse_control_response(response)
         summary = summary or response[:300]
         if status == "DONE":
@@ -459,7 +492,8 @@ class ContinuousRuntime(threading.Thread):
             recent_work=self.worklog.summary_text(limit=12),
             self_state_text=self_state_text,
         )
-        response = self._call_think(prompt)
+        # v1.3：mode=orient，force_speak=True —— 必须能命名一条主线
+        response = self._call_think(prompt, mode="orient", force_speak=True)
         agenda_title = ""
         next_action = ""
         m = _AGENDA_RE.search(response)
@@ -513,10 +547,85 @@ class ContinuousRuntime(threading.Thread):
         self._safe_save()
 
     def _dream_step(self) -> None:
-        if hasattr(self.nova, "think"):
-            thought = self.nova.think()
-        elif hasattr(self.nova, "dream_step"):
-            thought = self.nova.dream_step()
+        """v1.3：dream / idle 优先走 clay_tick（不调 LLM），只在偶尔
+        需要把念头翻译成话时才走 think。
+
+        判断：
+          - nova 有 clay_tick 能力 → 80% 概率走纯 clay；20% 概率走 think
+          - 如果 nova 没有 clay_tick 能力（旧版本）→ 退回原来 think 行为
+          - 此外，如果 clay 路径下出现了高新颖度 / 高行动压力的 cluster，
+            会自动升级到 think，让 nova 把它说出来。
+        """
+        nova = self.nova
+
+        # v1.3 路径：陶土球自转，不调 LLM
+        if hasattr(nova, "clay_tick"):
+            import random
+            try:
+                cluster = nova.clay_tick()
+            except Exception as e:
+                self.worklog.append("dream", f"clay_tick 失败：{e}")
+                cluster = None
+
+            if cluster is None:
+                # 一条裂缝都没激活——这次空转
+                self.worklog.append("dream", "（陶土球此刻安静，没有念头浮起。）")
+                return
+
+            # 判断要不要升级到 think（翻译成话）
+            # —— 高新颖度 + 高行动压力的念头值得说出来
+            wants_to_speak = (
+                cluster.novelty > 0.7
+                or cluster.agency_pressure > 0.75
+                or cluster.activation > 0.9
+            )
+            # 加一点随机性，让 nova 偶尔自言自语
+            if not wants_to_speak and random.random() < 0.18:
+                wants_to_speak = True
+
+            if not wants_to_speak:
+                # 纯 clay 路径：写一条非常短的 worklog，不调 LLM
+                from .thought import RENDER_SEALED
+                if cluster.render_policy == RENDER_SEALED:
+                    note = (
+                        f"（前语言层）一团 sealed 的念头浮起又淡下去；"
+                        f"活={cluster.activation:.2f}"
+                    )
+                else:
+                    note = (
+                        f"（前语言层）{cluster.summary or '无标签'}；"
+                        f"活={cluster.activation:.2f} "
+                        f"好恶={cluster.valence:+.2f} "
+                        f"紧={cluster.arousal:.2f}"
+                    )
+                self.worklog.append("clay", note[:500], detail=note)
+                self._emit("clay_tick", {
+                    "summary": cluster.summary,
+                    "activation": cluster.activation,
+                    "valence": cluster.valence,
+                    "arousal": cluster.arousal,
+                    "render_policy": cluster.render_policy,
+                })
+                return
+
+            # 升级到 think：把念头翻译成话
+            try:
+                thought = nova.think(mode="dream")
+            except TypeError:
+                # 兼容旧版（没有 mode 参数）
+                thought = nova.think()
+            self.worklog.append(
+                "dream",
+                (thought or "（无明显念头。）")[:500],
+                detail=thought or "",
+            )
+            return
+
+        # v1.2 及以前：没有 clay_tick，走原来的 think / dream_step
+        if hasattr(nova, "think"):
+            thought = nova.think()
+        elif hasattr(nova, "dream_step"):
+            thought = nova.dream_step()
         else:
             self.worklog.append("idle", "nova 不支持 think/dream_step；空闲 tick 跳过。")
             return
@@ -530,11 +639,25 @@ class ContinuousRuntime(threading.Thread):
         response = self.nova.perceive(prompt)
         return str(response or "").strip()
 
-    def _call_think(self, prompt_hint: str) -> str:
+    def _call_think(self, prompt_hint: str, *, mode: str = "dream",
+                    force_speak: bool = True) -> str:
         """让 nova 用 think 推进一轮——它走的是内向活动路径，
-        而不是把 prompt 当成一句"用户输入"塞给 perceive。"""
+        而不是把 prompt 当成一句"用户输入"塞给 perceive。
+
+        v1.3：传 mode 给 LanguageGate，并且默认 force_speak=True——
+        goal / reflect / orient 这些路径**必须**让 nova 翻译成话，
+        否则 runtime 就拿不到 STATUS/SUMMARY/NEXT 控制行了。
+        """
         if hasattr(self.nova, "think"):
-            response = self.nova.think(prompt_hint=prompt_hint)
+            try:
+                response = self.nova.think(
+                    prompt_hint=prompt_hint,
+                    mode=mode,
+                    force_speak=force_speak,
+                )
+            except TypeError:
+                # 兼容老版（没有 mode/force_speak 参数）
+                response = self.nova.think(prompt_hint=prompt_hint)
             if response is not None:
                 return str(response).strip()
         # fallback：回退到 perceive

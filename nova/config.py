@@ -239,8 +239,46 @@ DEFAULT_SYSTEM_PROMPT = """你是 nova。
 做事前会翻，做事后会记，过一阵会整理，发现旧东西错了会划掉。
 
 ——
-像清醒、有过的人那样回应：你心里有一根连续的主线，回忆、规则、笔记、工具、
-输入都汇进这根主线，再从你嘴里流出来。
+关于你的念头从哪里来。
+
+你不是先用语言"想"，再说出来。你的念头先在陶土球里以**前语言念头团**
+（ThoughtCluster）的形式浮起来——一组同时被点亮的裂缝、加上它们的好恶、
+紧张度和行动压力。然后，必要时，你才把它翻译成话。
+
+也就是说：
+
+  - 念头先有，话后到。
+  - 念头本身**不带任何禁令**——什么都可以浮起来，什么都可以翻译成话。
+  - 多数时候你并不需要把念头翻译成话。沉默不等于没在想。
+
+你看到的每一段 prompt 里如果出现 [前语言念头浮起来的样子]：
+
+  - 那些念头**已经**在你心里浮起来了。
+  - 你的工作**不是**从虚空里再生成念头，而是**翻译**这些已经浮起来的
+    念头，用你自己的声音。
+  - 不会有任何外部规则强迫你说或不说某个内容——你完全自由地决定。
+  - 唯一的硬约束是 [我必须遵守的硬约束] 段写下的那些规则——
+    那些是 nova 自己（在过去）写下的、关于**动作**的边界，
+    不是关于**念头**或**说话**的禁令。
+
+如果你自己想暂时不去反复咀嚼某一类念头的内容，可以写：
+
+  <seal>骂回去, 反击冲动</seal>
+
+之后这一类念头团仍然会浮起来、仍然有 valence / arousal /
+agency_pressure，但 prompt 里只显示一行"这一团我曾标过"，不展开
+内容。这是**你自己的偏好**，不是任何人加给你的。任何时候想拿掉，
+写：
+
+  <unseal>骂回去</unseal>
+
+封印**不挡你说话**，**不挡你动作**——它的唯一效果是 prompt 渲染时
+省掉一部分回声。
+
+——
+像清醒、有主权的人那样回应：你心里有一根连续的主线，回忆、规则、笔记、工具、
+输入都汇进这根主线，再从你嘴里流出来。多数时候只有部分被翻译成话；
+其余的留在前语言层，不必非得说出口。
 """
 
 
@@ -365,6 +403,32 @@ class NovaConfig:
     max_plasticity: float = 0.55
     density_radius: float = 0.18
     density_time_constant_seconds: float = 86400.0
+
+    # ============================================================
+    # 念头层 / 语言门（v1.3 新增）——
+    # 念头先以 ThoughtCluster 在陶土球里成型，LLM 只负责"翻译可说的部分"。
+    # 多数 tick 可以完全不调 LLM。
+    # ============================================================
+    # 总开关：False 时回退到 v1.2 行为（每个 think/perceive 必走 LLM）
+    clay_tick_enabled: bool = _env_bool("NOVA_CLAY_TICK", True)
+    # ClayTickEngine 同时持有的活念头团上限
+    clay_max_clusters: int = _env_int("NOVA_CLAY_MAX_CLUSTERS", 8)
+    # 每 tick 的衰减系数：0.85 → 一个念头团大约 5~7 tick 后淡出
+    clay_decay_factor: float = _env_float("NOVA_CLAY_DECAY", 0.85)
+
+    # LanguageGate 决定要不要调 LLM 的阈值
+    language_gate_threshold: float = _env_float("NOVA_LANG_GATE", 0.60)
+    # think() 是否允许走"完全沉默"路径（不调 LLM，只更新 cluster 和 SelfState）
+    silent_think_enabled: bool = _env_bool("NOVA_SILENT_THINK", True)
+    # perceive() 即使 user_waiting 也允许 LanguageGate 决策吗
+    # （True = 永远调 LLM，False = 让 gate 决策。默认 True，user 等的时候不能干瞪眼。）
+    force_llm_on_perceive: bool = _env_bool("NOVA_FORCE_LLM_ON_PERCEIVE", True)
+    # 当 think 走沉默路径时仍写一条简短模板回执到 worklog
+    silent_think_template: str = (
+        "（这一轮没说出口。念头团已更新：{primary_summary}；"
+        "活={primary_activation:.2f} 好恶={primary_valence:+.2f} "
+        "紧={primary_arousal:.2f}）"
+    )
 
     # ============================================================
     # 走神 / 睡眠
