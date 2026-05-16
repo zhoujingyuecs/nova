@@ -55,6 +55,14 @@ class AgendaItem:
     failures: int = 0
     tags: list[str] = field(default_factory=list)
 
+    # ---------- v1.4：集群范围 ----------
+    # scope = "local"  →  只属于本 node
+    # scope = "shared" →  和 swarm 共享；external_id 指向 SharedAgendaItem.agenda_id
+    scope: str = "local"
+    external_id: str = ""              # 共享 agenda 的 swarm 全局 ID
+    origin_node_id: str = ""           # 是谁第一个把它提交到 swarm 的
+    origin_node_name: str = ""
+
     def touch(self) -> None:
         self.updated_at = time.time()
 
@@ -182,6 +190,10 @@ class Agenda:
         next_action: str = "",
         tags: Optional[Iterable[str]] = None,
         save: bool = True,
+        scope: str = "local",
+        external_id: str = "",
+        origin_node_id: str = "",
+        origin_node_name: str = "",
     ) -> AgendaItem:
         with self._lock:
             title = (title or "").strip()
@@ -195,6 +207,10 @@ class Agenda:
                 drive=drive or "continuity",
                 next_action=(next_action or "").strip(),
                 tags=list(tags or []),
+                scope=scope or "local",
+                external_id=external_id or "",
+                origin_node_id=origin_node_id or "",
+                origin_node_name=origin_node_name or "",
             )
             self._items[item.id] = item
             self._trim_if_needed()
@@ -213,19 +229,44 @@ class Agenda:
         next_action: str = "",
         tags: Optional[Iterable[str]] = None,
         similarity_key: Optional[str] = None,
+        scope: str = "local",
+        external_id: str = "",
+        origin_node_id: str = "",
+        origin_node_name: str = "",
     ) -> AgendaItem:
         key = _norm_key(similarity_key or title)
         with self._lock:
+            # 优先按 external_id 命中（共享 agenda 不重复创建）
+            if external_id:
+                for item in self._items.values():
+                    if item.external_id == external_id:
+                        if description and description not in item.description:
+                            item.description = (item.description + "\n" + description).strip()
+                        item.priority = max(item.priority, priority)
+                        if next_action:
+                            item.next_action = next_action
+                        item.touch()
+                        self.save()
+                        return item
             for item in self._items.values():
                 if item.status in {STATUS_ACTIVE, STATUS_BLOCKED} and _norm_key(item.title) == key:
                     if description and description not in item.description:
                         item.description = (item.description + "\n" + description).strip()
                     item.priority = max(item.priority, priority)
+                    if scope == "shared" and item.scope != "shared":
+                        # 升级成共享
+                        item.scope = "shared"
+                        item.external_id = external_id or item.external_id
+                        item.origin_node_id = origin_node_id or item.origin_node_id
+                        item.origin_node_name = origin_node_name or item.origin_node_name
                     item.touch()
                     self.save()
                     return item
         return self.add(title, description, source=source, priority=priority,
-                        drive=drive, next_action=next_action, tags=tags)
+                        drive=drive, next_action=next_action, tags=tags,
+                        scope=scope, external_id=external_id,
+                        origin_node_id=origin_node_id,
+                        origin_node_name=origin_node_name)
 
     def update(
         self,
@@ -283,13 +324,31 @@ class Agenda:
         with self._lock:
             rows = []
             for item in self._sorted_items()[:limit]:
+                scope_tag = ""
+                if item.scope == "shared":
+                    who = item.origin_node_name or "swarm"
+                    scope_tag = f" [共享·{who}]"
                 rows.append(
-                    f"- [{item.status}] {item.title} "
+                    f"- [{item.status}] {item.title}{scope_tag} "
                     f"(id={item.id}, priority={item.priority:.2f}, drive={item.drive})"
                 )
                 if item.next_action:
                     rows.append(f"  next: {item.next_action}")
             return "\n".join(rows) if rows else "（agenda 为空。）"
+
+    def shared(self) -> list[AgendaItem]:
+        """所有 scope=shared 的 agenda（不论状态）。"""
+        with self._lock:
+            return [i for i in self._sorted_items() if i.scope == "shared"]
+
+    def by_external_id(self, external_id: str) -> Optional[AgendaItem]:
+        if not external_id:
+            return None
+        with self._lock:
+            for item in self._items.values():
+                if item.external_id == external_id:
+                    return item
+            return None
 
     # ---------- internals ----------
     def _sorted_items(self) -> list[AgendaItem]:

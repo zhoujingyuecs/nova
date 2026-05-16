@@ -247,6 +247,12 @@ class Nova:
 
         self._lock = threading.RLock()
 
+        # v1.4：swarm 适配器由外部（local.py / ContinuousRuntime）注入。
+        # 这里只占位；nova 自己不主动建链路，避免单机部署被强行连云端。
+        self.swarm: Optional[Any] = None
+        # 反向引用 ContinuousRuntime（被 ContinuousRuntime 自己注入）
+        self._runtime_ref: Optional[Any] = None
+
         if len(self.field) == 0 and self.cfg.seed_memories_file:
             self._load_seeds(self.cfg.seed_memories_file)
 
@@ -373,6 +379,16 @@ class Nova:
             new_rules = self._extract_and_save_rules(final_response, source=HABIT_SOURCE_SELF)
             # v1.3.1：拿掉 <seal> / <unseal> 块——nova 自己写下的封印清单更新
             self._apply_seal_blocks(final_response, primary_cluster=self.clay_tick_engine.primary())
+            # v1.4：解析 swarm 标签（share-memory / share-agenda / recall-swarm / propose / vote）
+            # 并将剥掉所有这些块之后的文本作为对外可见的回应。
+            if self.swarm is not None:
+                try:
+                    swarm_worklog = getattr(self._runtime_ref, "worklog", None)
+                    final_response = self.swarm.absorb_response(
+                        final_response, worklog=swarm_worklog
+                    )
+                except Exception as e:
+                    print(f"⚠️ swarm absorb_response 失败：{e}")
             visible = strip_rule_blocks(strip_seal_blocks(strip_actions(final_response))).strip() or "（沉默。）"
             visible = ToolLoopGuard.compact_visible_text(visible)
 
@@ -590,6 +606,14 @@ class Nova:
             # 把前语言念头段拼到 prompt 顶上（紧挨在 habit_block 之后）
             if cluster_block:
                 base_prompt = cluster_block + "\n\n" + base_prompt
+            # v1.4：swarm 状态拼在 prompt 头部
+            if self.swarm is not None:
+                try:
+                    swarm_block = self.swarm.build_swarm_block(max_chars=480).strip()
+                    if swarm_block:
+                        base_prompt = swarm_block + "\n\n" + base_prompt
+                except Exception:
+                    pass
             if prompt_hint:
                 user_prompt = prompt_hint.rstrip() + "\n\n" + base_prompt
             else:
@@ -604,6 +628,15 @@ class Nova:
             thought_raw = _strip_think_block(thought_raw)
             self._extract_and_save_rules(thought_raw, source=HABIT_SOURCE_SELF)
             self._apply_seal_blocks(thought_raw, primary_cluster=self.clay_tick_engine.primary())
+            # v1.4：解析 swarm 标签
+            if self.swarm is not None:
+                try:
+                    swarm_worklog = getattr(self._runtime_ref, "worklog", None)
+                    thought_raw = self.swarm.absorb_response(
+                        thought_raw, worklog=swarm_worklog
+                    )
+                except Exception as e:
+                    print(f"⚠️ swarm absorb_response (think) 失败：{e}")
             thought = strip_rule_blocks(strip_seal_blocks(strip_actions(thought_raw))).strip()
             thought = ToolLoopGuard.compact_visible_text(thought)
             if not thought:
@@ -917,6 +950,16 @@ class Nova:
         ws_block = self._render_workspace_block().strip()
         if ws_block:
             sections.append(ws_block)
+
+        # v1.4：swarm 状态 —— 让 nova 看见自己是哪个节点、还有谁在线、
+        # 哪些主线是跨集群推进的、哪些提案还在等仲裁
+        if self.swarm is not None:
+            try:
+                swarm_block = self.swarm.build_swarm_block(max_chars=600).strip()
+                if swarm_block:
+                    sections.append(swarm_block)
+            except Exception:
+                pass
 
         if others:
             block = [

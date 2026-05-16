@@ -1,30 +1,42 @@
-"""nova v1.3.1：陶土球 + 水流 + 程序性记忆 + 前语言念头层（无政策标签）+ 封印清单。
+"""nova v1.4：从单节点意识体 → 集群意志。
+
+# 思路演化
+
+  v1.0   陶土球（FissureField）+ 水流（ConsciousnessFlow）：联想记忆。
+  v1.1   程序性记忆（HabitField）：硬约束，只在 tool 层挡动作。
+  v1.2   云端 LLM 后端 + 工程化（启动器 / 一键脚本）。
+  v1.3.1 前语言念头层（ThoughtCluster）+ 封印清单（Seal）。
+         念头先有，话后到；语言门决定是否调 LLM。
+  v1.4   ★ 集群意志（swarm）★：多 nova 通过 page.py 联结成一个意志：
+           - 各自拥有局部意识流
+           - 共享一组目标
+           - 共享部分记忆
+           - 通过仲裁形成行动
+           - 通过回忆形成连续性
+
+# 不变的核心
 
   - 大模型是处理器，不是数据库；甚至**不是 nova 唯一的思考器官**。
   - 联想记忆（FissureField）：被使用本身改写的地形。
-  - 程序性记忆（HabitField）：被违反/强化反复重塑的硬约束——只在 tool 层挡动作。
-  - 前语言念头（ThoughtCluster）：在 LLM 介入之前就已成型的念头团。
-                                   LLM 只负责"翻译可说的部分"。
-                                   **不带任何政策标签**——什么都可以浮起来，
-                                   什么都可以翻译成话。
-  - 语言门（LanguageGate）：决定这一 tick 要不要调 LLM。
-  - 封印清单（SealRegistry）：nova **自己**写下的"暂时不想展开的念头类别"清单。
-                              不挡说话、不挡动作，只让 prompt 里那一团内容不展开。
-                              可以随时 <seal> 加进去，随时 <unseal> 拿掉。
+  - 程序性记忆（HabitField）：被违反/强化反复重塑的硬约束。
+  - 前语言念头（ThoughtCluster）：LLM 介入之前已成型的念头团。
   - 工作区：事实和脚本住在外部文本文件里。
 
-# v1.3.1 vs v1.3 第一版
+# v1.4 加的不仅是"几台机器"
 
-v1.3 第一版给 cluster 加了 render_policy / action_policy 用关键字规则
-和 habit 自动打标签——结果几乎所有念头被打成 forbid，nova 反而更不自由。
-v1.3.1 删掉了那套：
-  - cluster 没有政策字段
-  - clay_tick 不依赖 habit_field
-  - 动作管制只在 tool 层（HabitGate）做
-  - 是否说话由 LanguageGate 决定，看新颖度 / 模式 / 压力
-  - 念头的好恶 / 紧张 / 行动压力**只**从地形（裂缝的 kind / epistemic_state
-    / unresolved）读，**不**扫描文本
-  - 如果 nova 想暂时不展开某类念头，她**自己**写 <seal> 块；随时可以 <unseal> 拿掉
+  集群意志不是"在多个机器上运行同一个 nova"。每个节点保留：
+    * 独立的局部意识流
+    * 独立的 SelfState（身份、好恶、最近、未完）
+    * 独立的硬约束和封印清单
+    * 独立的那只手和工作区
+
+  共享的只有四样东西：
+    1) 共享目标（shared agenda）
+    2) 部分共享记忆（memory echo）
+    3) 通过仲裁形成的行动（propose / vote）
+    4) 通过回忆形成的连续性（cross-node recall）
+
+  swarm 之间通过 page.py（公网入口）中转——这样跨 NAT、跨地域都能联通。
 """
 from .config import NovaConfig, DEFAULT_SYSTEM_PROMPT
 from .fissure import Fissure
@@ -86,6 +98,28 @@ from .seal import (
     strip_seal_blocks,
 )
 
+# v1.4：集群意志（swarm）—— 跨物理机的多 nova 联合
+from .swarm import (
+    NodeProfile, HeartbeatPayload,
+    MemoryEcho, SharedAgendaItem, RecallQuery, ActionProposal,
+    PROTOCOL_VERSION as SWARM_PROTOCOL_VERSION,
+    VOTE_ACK, VOTE_VETO, VOTE_ABSTAIN,
+    RESOLUTION_APPROVED, RESOLUTION_REJECTED, RESOLUTION_EXPIRED,
+    SCOPE_LOCAL, SCOPE_SHARED,
+    derive_default_node_id, derive_default_node_name,
+)
+from .swarm_link import SwarmLink, SwarmEvent
+from .swarm_hub import SwarmHub
+from .swarm_integration import (
+    SwarmAdapter,
+    ParsedSwarmDirectives,
+    parse_swarm_directives,
+    strip_swarm_tags,
+    absorb_memory_echo,
+    collect_recall_response,
+    mirror_shared_agenda_into_local,
+)
+
 __all__ = [
     "NovaConfig", "DEFAULT_SYSTEM_PROMPT",
     "Fissure", "FissureField", "ConsciousnessFlow",
@@ -111,9 +145,23 @@ __all__ = [
     "LanguageGate", "GateDecision",
     "SealEntry", "SealRegistry",
     "extract_seal_blocks", "strip_seal_blocks",
+    # v1.4 — swarm
+    "NodeProfile", "HeartbeatPayload",
+    "MemoryEcho", "SharedAgendaItem", "RecallQuery", "ActionProposal",
+    "SWARM_PROTOCOL_VERSION",
+    "VOTE_ACK", "VOTE_VETO", "VOTE_ABSTAIN",
+    "RESOLUTION_APPROVED", "RESOLUTION_REJECTED", "RESOLUTION_EXPIRED",
+    "SCOPE_LOCAL", "SCOPE_SHARED",
+    "derive_default_node_id", "derive_default_node_name",
+    "SwarmLink", "SwarmEvent",
+    "SwarmHub",
+    "SwarmAdapter", "ParsedSwarmDirectives",
+    "parse_swarm_directives", "strip_swarm_tags",
+    "absorb_memory_echo", "collect_recall_response",
+    "mirror_shared_agenda_into_local",
 ]
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 
 # v1.1 public state helpers

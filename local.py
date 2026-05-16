@@ -1,15 +1,26 @@
 # coding=UTF-8
-"""local.py —— 本地 nova 入口（持续运行 + page 桥接）
+"""local.py —— 本地 nova 节点入口（持续运行 + page 中继 + swarm 联结）
 
 启动时唤醒 Nova，立即跑 ContinuousRuntime（nova 持续生活）；
-同时用 socketio.Client 连云端 page.py，page 派来的对话被当作"外部打断"
-投进 runtime，处理完通过 chat_result 回传。
+同时用 socketio.Client 连云端 page.py。这条 socket 同时承担两件事：
+
+  1) 旧的访客对话中继（v1.3.1 起的 chat_result / new_chat_task）
+  2) 新的 swarm 协议（v1.4 起的 swarm_* 事件）——把这台机器作为一个
+     **node** 接入 swarm，与其它物理机的 nova 联合。
+
+跨物理机运行：
+  机器 A、B、C 各自跑 local.py，都连同一个 page.py。
+  page.py 内部的 SwarmHub 中继它们之间的消息——它们就形成了一个
+  swarm。每个 node 仍然是独立的 nova，但**共享目标、共享部分记忆、
+  通过仲裁形成行动、通过回忆形成连续性**。
 
 运行：
     python local.py
     python local.py --commission "重写 README，让外部读者理解 nova"
     python local.py --cloud http://your-host:8080
     python local.py --no-cloud           # 只跑 runtime，不连 page
+    python local.py --no-swarm           # 连 page 但不入 swarm（v1.3.1 行为）
+    python local.py --node-name 白烬·北京
 
 不传 --commission 时，nova 会先 self_orientation，自己生成主线。
 """
@@ -17,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 import threading
 import time
@@ -26,10 +38,16 @@ import socketio
 
 from nova import Nova, NovaConfig
 from nova.runtime import ContinuousRuntime
+from nova.swarm import (
+    NodeProfile, PROTOCOL_VERSION as SWARM_PROTOCOL_VERSION,
+    derive_default_node_id, derive_default_node_name,
+)
+from nova.swarm_link import SwarmLink
+from nova.swarm_integration import SwarmAdapter
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="nova 本地服务（持续运行 + 连 page）")
+    p = argparse.ArgumentParser(description="nova 本地节点（持续运行 + 连 page + swarm）")
     p.add_argument(
         "--cloud",
         default=os.environ.get("NOVA_CLOUD_URL", "http://127.0.0.1:8080"),
@@ -61,6 +79,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只跑 ContinuousRuntime，不连 page（本地内省模式）",
     )
+    p.add_argument(
+        "--no-swarm",
+        action="store_true",
+        help="连 page 但不加入 swarm（v1.3.1 行为，单节点）",
+    )
+    p.add_argument(
+        "--node-name",
+        default=os.environ.get("NOVA_NODE_NAME", ""),
+        help="本节点在 swarm 里的可读名（默认从 hostname 推导）",
+    )
+    p.add_argument(
+        "--swarm-id",
+        default=os.environ.get("NOVA_SWARM_ID", "default"),
+        help="加入哪个 swarm（同一台 page 上可以承载多个）",
+    )
     return p.parse_args()
 
 
@@ -71,6 +104,13 @@ def boot_runtime(args: argparse.Namespace) -> ContinuousRuntime:
         field_path=args.field_path,
         seed_memories_file=seed,
     )
+    # 命令行覆盖：swarm 名 / id
+    if args.node_name:
+        cfg.swarm_node_name = args.node_name
+    if args.swarm_id:
+        cfg.swarm_id = args.swarm_id
+    if args.no_swarm or args.no_cloud:
+        cfg.swarm_enabled = False
     nova = Nova(cfg)
     print(f"✅ nova 已醒。当前缝隙数：{len(nova.field)}")
 
@@ -83,6 +123,27 @@ def boot_runtime(args: argparse.Namespace) -> ContinuousRuntime:
     return runtime
 
 
+def build_node_profile(cfg: NovaConfig) -> NodeProfile:
+    node_id = (cfg.swarm_node_id or "").strip() \
+        or derive_default_node_id(cfg.field_path)
+    node_name = (cfg.swarm_node_name or "").strip() \
+        or derive_default_node_name()
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        hostname = ""
+    return NodeProfile(
+        node_id=node_id,
+        node_name=node_name,
+        swarm_id=cfg.swarm_id or "default",
+        hostname=hostname,
+        version=SWARM_PROTOCOL_VERSION,
+        embedding_model=cfg.embedding_model,
+        embedding_dim=0,           # 真实值由 Embedder 决定，会在 attach 时填上
+        backend=cfg.llm_backend,
+    )
+
+
 def build_socket_client(runtime: ContinuousRuntime,
                         task_timeout: float) -> socketio.Client:
     sio = socketio.Client(
@@ -93,9 +154,48 @@ def build_socket_client(runtime: ContinuousRuntime,
         randomization_factor=0.5,
     )
 
+    nova = runtime.nova
+    cfg = nova.cfg
+
+    # v1.4：装配 swarm 链路（如果 cfg.swarm_enabled）
+    swarm_link = None
+    if getattr(cfg, "swarm_enabled", True):
+        profile = build_node_profile(cfg)
+        profile.embedding_dim = int(getattr(nova.embedder, "dim", 0))
+        swarm_link = SwarmLink(sio, profile)
+        swarm_link.bind()
+        adapter = SwarmAdapter(nova, swarm_link)
+        nova.swarm = adapter
+        print(
+            f"🌌 swarm 装配完成：节点名 {profile.node_name}"
+            f" id={profile.node_id} swarm_id={profile.swarm_id}"
+        )
+    else:
+        print("（已禁用 swarm，按 v1.3.1 单节点形态运行）")
+
     @sio.event
     def connect() -> None:
         print(f"🔗 已连接云端 page")
+        if swarm_link is None:
+            return
+
+        def _delayed_hello():
+            # 等握手稳定再 emit;不然 sio.connected 可能还是 False
+            time.sleep(0.5)
+            try:
+                ok = swarm_link.hello()
+                print(f"🌌 swarm hello 已发送(ok={ok})")
+            except Exception as e:
+                print(f"⚠️ swarm hello 失败:{e}")
+            try:
+                adapter = nova.swarm
+                if adapter is not None:
+                    adapter.send_heartbeat(force=True)
+            except Exception as e:
+                print(f"⚠️ swarm heartbeat 失败:{e}")
+
+        threading.Thread(target=_delayed_hello, daemon=True,
+                         name="swarm-initial-hello").start()
 
     @sio.event
     def connect_error(data) -> None:

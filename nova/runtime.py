@@ -113,6 +113,13 @@ class ContinuousRuntime(threading.Thread):
         base_path = getattr(self.cfg, "field_path", "./field") if self.cfg else "./field"
         os.makedirs(base_path, exist_ok=True)
 
+        # v1.4：把自己反向暴露给 nova，便于 swarm 适配器在解析 nova
+        # 输出的 share-agenda 时能找到 agenda / worklog。
+        try:
+            setattr(nova, "_runtime_ref", self)
+        except Exception:
+            pass
+
         self.agenda = Agenda(agenda_path or os.path.join(base_path, "agenda.json"))
         self.agenda.load()
 
@@ -242,6 +249,27 @@ class ContinuousRuntime(threading.Thread):
                 }
             except Exception:
                 pass
+        # v1.4：swarm 状态
+        swarm = getattr(self.nova, "swarm", None)
+        if swarm is not None and getattr(swarm, "link", None) is not None:
+            try:
+                link = swarm.link
+                data["swarm"] = {
+                    "enabled": True,
+                    "node_id": link.profile.node_id,
+                    "node_name": link.profile.node_name,
+                    "swarm_id": link.profile.swarm_id,
+                    "welcomed": link.is_welcomed(),
+                    "peers": [
+                        {"node_id": p.node_id, "node_name": p.node_name}
+                        for p in link.peers()
+                    ],
+                    "pending_proposals": len(swarm._open_proposals),
+                }
+            except Exception:
+                data["swarm"] = {"enabled": True, "error": "status_failed"}
+        else:
+            data["swarm"] = {"enabled": False}
         return data
 
     def status_text(self) -> str:
@@ -299,6 +327,19 @@ class ContinuousRuntime(threading.Thread):
             parts.append(
                 f"语言门：上次决策={verdict} (score={last_gate.get('score', 0):.2f})"
             )
+        # v1.4：swarm
+        sw = state.get("swarm") or {}
+        if sw.get("enabled"):
+            peers = sw.get("peers") or []
+            parts.append("")
+            parts.append(
+                f"swarm: 我是 {sw.get('node_name', '')}（{sw.get('node_id', '')[:10]}…）"
+                f"  swarm_id={sw.get('swarm_id', 'default')}"
+                f"  在线同类={len(peers)}"
+                f"  待裁决={sw.get('pending_proposals', 0)}"
+            )
+            if peers:
+                parts.append("  同类：" + "、".join(p["node_name"] for p in peers[:8]))
         return "\n".join(parts)
 
     def recent_work_text(self, *, limit: int = 12) -> str:
@@ -354,6 +395,18 @@ class ContinuousRuntime(threading.Thread):
             self._state.last_tick_at = time.time()
             self._state.tick_count += 1
             tick_count = self._state.tick_count
+
+        # v1.4：在 tick 开头消化 swarm 入站事件 + 视情况发心跳
+        swarm = getattr(self.nova, "swarm", None)
+        if swarm is not None:
+            try:
+                swarm.drain_inbox(worklog=self.worklog)
+            except Exception as e:
+                self.worklog.append("error", f"swarm drain_inbox 失败：{e}")
+            try:
+                swarm.send_heartbeat()
+            except Exception as e:
+                self.worklog.append("error", f"swarm heartbeat 失败：{e}")
 
         try:
             if decision.mode == MODE_INTERRUPT:
@@ -456,6 +509,21 @@ class ContinuousRuntime(threading.Thread):
             kind = "goal"
 
         self.worklog.append(kind, summary, detail=response, agenda_id=item.id)
+
+        # v1.4：如果这是 shared agenda，把进度同步给 swarm
+        swarm = getattr(self.nova, "swarm", None)
+        if swarm is not None and getattr(item, "scope", "") == "shared" \
+                and getattr(item, "external_id", ""):
+            try:
+                swarm.report_progress_for(
+                    item,
+                    summary=summary,
+                    next_action=next_action,
+                    status=item.status,
+                )
+            except Exception as e:
+                self.worklog.append("error", f"swarm report_progress 失败：{e}")
+
         self._emit(kind, {"agenda_id": item.id, "summary": summary, "status": status})
         if status == "SLEEP":
             self._sleep_step("requested by goal step")
